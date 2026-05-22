@@ -89,7 +89,14 @@ class Mapper(object):
         self._set_hyperparams()
 
         # Set frame reader (where we get the input dataset)
-        self.frame_reader = get_dataset(self.config, device=self.device)
+        if hasattr(slam, "external_frame_reader"):
+            self.frame_reader = slam.external_frame_reader
+            self.printer.print(
+                "Using external Navigator frame reader for mapping",
+                FontColor.MAPPER
+            )
+        else:
+            self.frame_reader = get_dataset(self.config, device=self.device)
         self.intrinsics = as_intrinsics_matrix(self.frame_reader.get_intrinsic()).to(
             self.device
         )
@@ -776,9 +783,22 @@ class Mapper(object):
             self.is_kf[video_idx] = True
             self.frame_count_log[video_idx] = 0
 
+            print("[INIT PCD DEBUG] before extend | video_idx:", video_idx,
+                  "frame_idx:", frame_idx,
+                  "n_gauss:", self.gaussians.get_xyz.shape[0])
+
+            print("[INIT PCD DEBUG] depth shape:", viewpoint.depth.shape,
+                  "depth min:", np.min(viewpoint.depth),
+                  "depth max:", np.max(viewpoint.depth),
+                  "depth mean:", np.mean(viewpoint.depth),
+                  "valid depth:", np.sum(viewpoint.depth > 0))
+
             self.gaussians.extend_from_pcd_seq(
                 viewpoint, kf_id=video_idx, init=True, depthmap=viewpoint.depth
             )
+
+            print("[INIT PCD DEBUG] after extend | video_idx:", video_idx,
+                  "n_gauss:", self.gaussians.get_xyz.shape[0])
 
             self.current_window.append(video_idx)
 
@@ -961,7 +981,7 @@ class Mapper(object):
                     image,
                     depth,
                     viewpoint,
-                    opacity,
+
                     initialization=True,
                 )
             else:
@@ -1115,7 +1135,7 @@ class Mapper(object):
                 ).squeeze(0)
             if not self.uncertainty_aware:
                 loss_mapping += get_loss_mapping(
-                    self.config["mapping"], image, depth, viewpoint, opacity
+                    self.config["mapping"], image, depth, viewpoint
                 )
             else:
                 train_frac = self.uncer_params["train_frac_fix"]
@@ -1286,7 +1306,7 @@ class Mapper(object):
                 ).squeeze(0)
             if not self.uncertainty_aware:
                 loss_mapping += get_loss_mapping(
-                    self.config["mapping"], image, depth, viewpoint, opacity
+                    self.config["mapping"], image, depth, viewpoint
                 )
             else:
                 train_frac = self.uncer_params["train_frac_fix"]

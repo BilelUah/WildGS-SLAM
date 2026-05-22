@@ -114,10 +114,20 @@ class GaussianModel:
 
         if depthmap is not None:
             rgb = o3d.geometry.Image(rgb_raw.astype(np.uint8))
+
             if self.config["mapping"]["full_resolution"]:
-                depthmap = F.interpolate(torch.tensor(depthmap).cuda().unsqueeze(0).unsqueeze(0),
-                                         rgb_raw.shape[:2],mode='bicubic').squeeze().cpu().numpy()
+                depthmap = F.interpolate(
+                    torch.tensor(depthmap).cuda().unsqueeze(0).unsqueeze(0),
+                    rgb_raw.shape[:2],
+                    mode='bicubic'
+                ).squeeze().cpu().numpy()
+
+            depthmap = np.asarray(depthmap).astype(np.float32)
+            depthmap[depthmap < self.config["mapping"].get("depth_min", 0.2)] = 0.0
+            depthmap[depthmap > self.config["mapping"].get("depth_max", 4.0)] = 0.0
+
             depth = o3d.geometry.Image(depthmap.astype(np.float32))
+
         else:
             depth_raw = cam.depth
             if depth_raw is None:
@@ -152,11 +162,18 @@ class GaussianModel:
             rgb,
             depth,
             depth_scale=1.0,
-            depth_trunc=100.0,
+            depth_trunc=self.config["mapping"].get("depth_trunc", 100.0),
             convert_rgb_to_intensity=False,
         )
 
         W2C = getWorld2View2(cam.R, cam.T).cpu().numpy()
+
+        print("[EXTRINSIC DEBUG]")
+        print(W2C)
+
+        print("[EXTRINSIC DEBUG inv(W2C)]")
+        print(np.linalg.inv(W2C))
+
         pcd_tmp = o3d.geometry.PointCloud.create_from_rgbd_image(
             rgbd,
             o3d.camera.PinholeCameraIntrinsic(
@@ -170,6 +187,7 @@ class GaussianModel:
             extrinsic=W2C,
             project_valid_depth_only=True,
         )
+
         points = np.asarray(pcd_tmp.points)
         colors = np.asarray(pcd_tmp.colors)
 
