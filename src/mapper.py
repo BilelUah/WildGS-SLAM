@@ -221,9 +221,35 @@ class Mapper(object):
             self.depth_dict[video_idx] = torch.tensor(viewpoint.depth).to(self.device)
             self.frame_count_log[video_idx] = 0
 
+            if int(frame_idx) in [98, 107, 116, 125, 134]:
+                xyz_before_insert = self.gaussians.get_xyz.detach()
+                print("\n========== ORIG INSERT DEBUG BEFORE ==========")
+                print("[ORIG INSERT] frame_idx:", frame_idx)
+                print("[ORIG INSERT] video_idx:", video_idx)
+                print("[ORIG INSERT] n_gauss before insert:", int(xyz_before_insert.shape[0]))
+                print("[ORIG INSERT] xyz min before:",
+                      xyz_before_insert.min(dim=0).values.detach().cpu().numpy())
+                print("[ORIG INSERT] xyz max before:",
+                      xyz_before_insert.max(dim=0).values.detach().cpu().numpy())
+                print("==============================================\n")
+
             self.gaussians.extend_from_pcd_seq(
                 viewpoint, kf_id=video_idx, init=False, depthmap=viewpoint.depth
             )
+
+            if int(frame_idx) in [98, 107, 116, 125, 134]:
+                xyz_after_insert = self.gaussians.get_xyz.detach()
+                print("\n========== ORIG INSERT DEBUG AFTER ==========")
+                print("[ORIG INSERT] frame_idx:", frame_idx)
+                print("[ORIG INSERT] video_idx:", video_idx)
+                print("[ORIG INSERT] n_gauss after insert:", int(xyz_after_insert.shape[0]))
+                print("[ORIG INSERT] delta:",
+                      int(xyz_after_insert.shape[0]) - int(xyz_before_insert.shape[0]))
+                print("[ORIG INSERT] xyz min after:",
+                      xyz_after_insert.min(dim=0).values.detach().cpu().numpy())
+                print("[ORIG INSERT] xyz max after:",
+                      xyz_after_insert.max(dim=0).values.detach().cpu().numpy())
+                print("=============================================\n")
 
             opt_params = []
             for cam_idx in range(len(self.current_window)):
@@ -248,23 +274,70 @@ class Mapper(object):
             self.keyframe_optimizers = torch.optim.Adam(opt_params)
 
             with Lock():
+                debug_online_frames = {107, 116, 125, 134, 143, 152}
+
+                if int(frame_idx) in debug_online_frames:
+                    with torch.no_grad():
+                        xyz_pre_opt = self.gaussians.get_xyz.detach()
+
+                        print("\n========== ORIG MAP OPT DEBUG BEFORE ==========")
+                        print("[ORIG MAP OPT] frame_idx:", frame_idx)
+                        print("[ORIG MAP OPT] video_idx:", video_idx)
+                        print("[ORIG MAP OPT] current_window:", self.current_window)
+                        print("[ORIG MAP OPT] n_gauss before opt:", int(xyz_pre_opt.shape[0]))
+                        print("[ORIG MAP OPT] xyz min before:",
+                              xyz_pre_opt.min(dim=0).values.detach().cpu().numpy())
+                        print("[ORIG MAP OPT] xyz max before:",
+                              xyz_pre_opt.max(dim=0).values.detach().cpu().numpy())
+                        print("================================================\n")
+
                 if self.config['fast_mode']:
-                    # We are in fast mode,
-                    # update map and uncertainty MLP every 4 key frames
                     if video_idx % 4 == 0:
                         gaussian_split = self.map_opt_online(
                             self.current_window, iters=self.mapping_itr_num
                         )
                     else:
                         self._update_occ_aware_visibility(self.current_window)
+                        gaussian_split = False
                 else:
                     gaussian_split = self.map_opt_online(
                         self.current_window, iters=self.mapping_itr_num
                     )
 
+                if int(frame_idx) in debug_online_frames:
+                    with torch.no_grad():
+                        xyz_post_opt = self.gaussians.get_xyz.detach()
+
+                        print("\n========== ORIG MAP OPT DEBUG AFTER ==========")
+                        print("[ORIG MAP OPT] frame_idx:", frame_idx)
+                        print("[ORIG MAP OPT] video_idx:", video_idx)
+                        print("[ORIG MAP OPT] gaussian_split:", gaussian_split)
+                        print("[ORIG MAP OPT] n_gauss after opt:", int(xyz_post_opt.shape[0]))
+                        print("[ORIG MAP OPT] xyz min after:",
+                              xyz_post_opt.min(dim=0).values.detach().cpu().numpy())
+                        print("[ORIG MAP OPT] xyz max after:",
+                              xyz_post_opt.max(dim=0).values.detach().cpu().numpy())
+                        print("==============================================\n")
+
                 if gaussian_split:
-                    # do one more iteration after densify and prune
+                    if int(frame_idx) in debug_online_frames:
+                        print("[ORIG MAP OPT] running extra 1 iteration after gaussian_split")
+
                     self.map_opt_online(self.current_window, iters=1)
+
+                    if int(frame_idx) in debug_online_frames:
+                        with torch.no_grad():
+                            xyz_extra = self.gaussians.get_xyz.detach()
+
+                            print("\n========== ORIG MAP OPT DEBUG AFTER EXTRA ==========")
+                            print("[ORIG MAP OPT] frame_idx:", frame_idx)
+                            print("[ORIG MAP OPT] video_idx:", video_idx)
+                            print("[ORIG MAP OPT] n_gauss after extra:", int(xyz_extra.shape[0]))
+                            print("[ORIG MAP OPT] xyz min after extra:",
+                                  xyz_extra.min(dim=0).values.detach().cpu().numpy())
+                            print("[ORIG MAP OPT] xyz max after extra:",
+                                  xyz_extra.max(dim=0).values.detach().cpu().numpy())
+                            print("====================================================\n")
             torch.cuda.empty_cache()
 
             if self.config['gui']:
@@ -820,9 +893,38 @@ class Mapper(object):
                 )
         self.keyframe_optimizers = torch.optim.Adam(opt_params)
 
+        with torch.no_grad():
+            xyz_before_init_opt = self.gaussians.get_xyz.detach()
+
+            print("\n========== ORIG INIT MAP OPT DEBUG BEFORE ==========")
+            print("[ORIG INIT OPT] cur_video_idx:", cur_video_idx)
+            print("[ORIG INIT OPT] current_window before:", self.current_window)
+            print("[ORIG INIT OPT] n_gauss before init opt:", int(xyz_before_init_opt.shape[0]))
+            print("[ORIG INIT OPT] xyz min before:",
+                  xyz_before_init_opt.min(dim=0).values.detach().cpu().numpy())
+            print("[ORIG INIT OPT] xyz max before:",
+                  xyz_before_init_opt.max(dim=0).values.detach().cpu().numpy())
+            print("====================================================\n")
+
         self.initialize_map_opt()
+
+        with torch.no_grad():
+            xyz_after_init_opt = self.gaussians.get_xyz.detach()
+
+            print("\n========== ORIG INIT MAP OPT DEBUG AFTER ==========")
+            print("[ORIG INIT OPT] cur_video_idx:", cur_video_idx)
+            print("[ORIG INIT OPT] current_window after init opt:", self.current_window)
+            print("[ORIG INIT OPT] n_gauss after init opt:", int(xyz_after_init_opt.shape[0]))
+            print("[ORIG INIT OPT] xyz min after:",
+                  xyz_after_init_opt.min(dim=0).values.detach().cpu().numpy())
+            print("[ORIG INIT OPT] xyz max after:",
+                  xyz_after_init_opt.max(dim=0).values.detach().cpu().numpy())
+            print("===================================================\n")
+
         # Only keep the recent <self.window_size> number of keyframes in the window
-        self.current_window = self.current_window[-self.window_size :]
+        self.current_window = self.current_window[-self.window_size:]
+
+        print("[ORIG INIT OPT] current_window after trim:", self.current_window)
 
         if self.config['gui']:
             self._send_to_gui(cur_video_idx)

@@ -62,7 +62,7 @@ mapping:
     compute_cov3D_python: False
 
   uncertainty_params:
-    activate: True
+    activate: False
     vis_uncertainty_online: False
     feature_dim: 384
     feature_type: "dino"
@@ -118,7 +118,7 @@ tracking:
     metric_depth_reg: True # whether to use metric depth to guide disparity in BA, always set to True
     normalize: False    # whether to normalize disps after each BA iter
   uncertainty_params:
-    activate: True
+    activate: False
   force_keyframe_every_n_frames: 9 # set to negative value if you don't want to force to insert keyframes
   nb_ref_frame_metric_depth_filtering: 6 # number of reference frames for filtering high uncertainty metric depth points
 
