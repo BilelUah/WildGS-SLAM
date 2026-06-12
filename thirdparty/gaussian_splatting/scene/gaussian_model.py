@@ -18,7 +18,7 @@ from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from torch import nn
 import torch.nn.functional as F
-
+import hashlib
 from thirdparty.gaussian_splatting.utils.general_utils import (
     build_rotation,
     build_scaling_rotation,
@@ -196,6 +196,21 @@ class GaussianModel:
         pcd_tmp = pcd_tmp.random_down_sample(1.0 / downsample_factor)
         new_xyz = np.asarray(pcd_tmp.points)
         new_rgb = np.asarray(pcd_tmp.colors)
+
+        if init:
+            xyz_np = np.asarray(new_xyz).astype(np.float32)
+            rgb_np = np.asarray(new_rgb).astype(np.float32)
+
+            print("\n========== O3D SAMPLE DEBUG ==========")
+            print("[O3D SAMPLE] init:", init)
+            print("[O3D SAMPLE] cam.uid:", int(cam.uid))
+            print("[O3D SAMPLE] n:", xyz_np.shape[0])
+            print("[O3D SAMPLE] xyz min:", xyz_np.min(axis=0))
+            print("[O3D SAMPLE] xyz max:", xyz_np.max(axis=0))
+            print("[O3D SAMPLE] xyz mean:", xyz_np.mean(axis=0))
+            print("[O3D SAMPLE] xyz md5:", hashlib.md5(np.ascontiguousarray(xyz_np).tobytes()).hexdigest())
+            print("[O3D SAMPLE] rgb md5:", hashlib.md5(np.ascontiguousarray(rgb_np).tobytes()).hexdigest())
+            print("======================================\n")
 
         pcd = BasicPointCloud(
             points=new_xyz, colors=new_rgb, normals=np.zeros((new_xyz.shape[0], 3))

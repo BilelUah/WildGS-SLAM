@@ -842,6 +842,29 @@ class Mapper(object):
             self.video_idxs.append(video_idx)
 
             viewpoint, invalid = self._get_viewpoint(video_idx, frame_idx)
+
+            if video_idx <= 11:
+                import hashlib
+                d = np.asarray(viewpoint.depth, dtype=np.float32)
+
+                print("\n========== VIEWPOINT DEPTH EXACT DEBUG ==========")
+                print("[VIEW DEPTH EXACT] video_idx:", video_idx)
+                print("[VIEW DEPTH EXACT] frame_idx:", frame_idx)
+                print("[VIEW DEPTH EXACT] shape:", d.shape)
+                print("[VIEW DEPTH EXACT] sum:", float(d.sum()))
+                print("[VIEW DEPTH EXACT] mean:", float(d.mean()))
+                print("[VIEW DEPTH EXACT] std:", float(d.std()))
+                print("[VIEW DEPTH EXACT] min:", float(d.min()))
+                print("[VIEW DEPTH EXACT] max:", float(d.max()))
+                print("[VIEW DEPTH EXACT] nonzero:", int(np.count_nonzero(d)))
+                print("[VIEW DEPTH EXACT] sample_0_0:", float(d[0, 0]))
+                print("[VIEW DEPTH EXACT] sample_100_100:", float(d[100, 100]))
+                print("[VIEW DEPTH EXACT] sample_180_320:", float(d[180, 320]))
+                print("[VIEW DEPTH EXACT] sample_250_500:", float(d[250, 500]))
+                print("[VIEW DEPTH EXACT] md5:", hashlib.md5(d.tobytes()).hexdigest())
+                print("================================================\n")
+
+
             # Dictionary of Camera objects at the frame index
             self.cameras[video_idx] = viewpoint
 
