@@ -64,7 +64,7 @@ def get_dataset(cfg, device='cuda:0'):
     return dataset_dict[cfg['dataset']](cfg, device=device)
 
 
-class BaseDataset(Dataset):
+class BaseDataset(Dataset): # read the intrinsics of the camera like H, W fx, fy, cx, cy
     def __init__(self, cfg, device='cuda:0'):
         super(BaseDataset, self).__init__()
         self.name = cfg['dataset']
@@ -80,7 +80,7 @@ class BaseDataset(Dataset):
             'W'], cfg['cam']['fx'], cfg['cam']['fy'], cfg['cam']['cx'], cfg['cam']['cy']
         self.fx_orig, self.fy_orig, self.cx_orig, self.cy_orig = self.fx, self.fy, self.cx, self.cy
         self.H_out, self.W_out = cfg['cam']['H_out'], cfg['cam']['W_out']
-        self.H_edge, self.W_edge = cfg['cam']['H_edge'], cfg['cam']['W_edge']
+        self.H_edge, self.W_edge = cfg['cam']['H_edge'], cfg['cam']['W_edge']  #
 
         self.H_out_with_edge, self.W_out_with_edge = self.H_out + self.H_edge * 2, self.W_out + self.W_edge * 2
         self.intrinsic = torch.as_tensor([self.fx, self.fy, self.cx, self.cy]).float()

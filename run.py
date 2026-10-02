@@ -21,6 +21,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('config', type=str, help='Path to config file.')
     args = parser.parse_args()
+    print(args)
 
     torch.multiprocessing.set_start_method('spawn')
 

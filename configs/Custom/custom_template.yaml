@@ -1,10 +1,10 @@
 
 inherit_from: ./configs/wildgs_slam.yaml
-scene: BileAlexis # Replace with your scene name
+scene: BileIndoor # Replace with your scene name
 
 dataset: 'wild_slam_iphone'
 data:
-  input_folder: ./datasets/Dataset_BileAlexis
+  input_folder: ./datasets/Indoor_Bile
   output: ./output/Custom
 
 cam:

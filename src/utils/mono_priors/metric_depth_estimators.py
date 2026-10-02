@@ -107,12 +107,7 @@ def predict_metric_depth(
         # If use other metric depth estimator as prior, write the code here
         raise NotImplementedError("Unsupported depth model")
 
-    _debug_metric_depth_io(
-        input_tensor=input_tensor,
-        depth_map=output,
-        cfg=cfg,
-        idx=idx
-    )
+
 
     if save_depth:
         _save_depth_map(output, cfg, idx)
@@ -158,90 +153,12 @@ def _predict_metric3d_depth(
 
     canonical_to_real_scale = cfg["cam"]["fx"] / 1000.0
 
-    if cfg.get("debug_metric_depth_scale", True):
-        print("\n========== METRIC3D SCALE DEBUG ==========")
-        print("[METRIC3D SCALE] cfg cam fx:", cfg["cam"]["fx"])
-        print("[METRIC3D SCALE] cfg cam fy:", cfg["cam"].get("fy"))
-        print("[METRIC3D SCALE] input h/w:", h, w)
-        print("[METRIC3D SCALE] canonical_to_real_scale:", canonical_to_real_scale)
-        print("==========================================\n")
+
 
     pred_depth = pred_depth * canonical_to_real_scale
     return torch.clamp(pred_depth, 0, 300)
 
-def _debug_metric_depth_io(
-    input_tensor: torch.Tensor,
-    depth_map: torch.Tensor,
-    cfg: Dict,
-    idx: int,
-) -> None:
-    """
-    Debug only.
-    Saves the exact RGB tensor given to MetricDepth and the predicted depth.
-    This does NOT modify input_tensor or depth_map.
-    """
-    debug_frames = {0, 9, 18, 98, 107, 134}
 
-    idx_int = int(idx)
-    if idx_int not in debug_frames:
-        return
-
-    try:
-        import os
-        import imageio.v2 as imageio
-
-        scene = str(cfg.get("scene", "unknown_scene"))
-        output_root = str(cfg.get("data", {}).get("output", "./output"))
-
-        debug_dir = os.path.join(
-            output_root,
-            scene,
-            "debug_metric_depth"
-        )
-        os.makedirs(debug_dir, exist_ok=True)
-
-        # Save RGB input
-        img = input_tensor.detach().float().cpu()
-
-        # Expected shape: [1, 3, H, W]
-        if img.ndim == 4:
-            img = img[0]
-
-        # [3, H, W] -> [H, W, 3]
-        if img.ndim == 3 and img.shape[0] == 3:
-            img = img.permute(1, 2, 0)
-
-        img_np = img.numpy()
-        img_u8 = (np.clip(img_np, 0.0, 1.0) * 255.0).astype(np.uint8)
-
-        rgb_path = os.path.join(debug_dir, f"rgb_metric_input_{idx_int:06d}.png")
-        imageio.imwrite(rgb_path, img_u8)
-
-        # Save depth output
-        d = depth_map.detach().float().cpu().numpy()
-        depth_path = os.path.join(debug_dir, f"depth_metric_output_{idx_int:06d}.npy")
-        np.save(depth_path, d)
-
-        valid = d > 0
-
-        print("\n========== METRIC DEPTH DEBUG ==========")
-        print("[METRIC DEPTH DEBUG] frame:", idx_int)
-        print("[METRIC DEPTH DEBUG] scene:", scene)
-        print("[METRIC DEPTH DEBUG] rgb saved:", rgb_path)
-        print("[METRIC DEPTH DEBUG] depth saved:", depth_path)
-        print("[METRIC DEPTH DEBUG] input image shape:", img_u8.shape)
-        print("[METRIC DEPTH DEBUG] input image mean:", float(img_u8.mean()))
-        print("[METRIC DEPTH DEBUG] input image min/max:", int(img_u8.min()), int(img_u8.max()))
-        print("[METRIC DEPTH DEBUG] depth shape:", d.shape)
-        print("[METRIC DEPTH DEBUG] valid ratio:", float(valid.mean()))
-        print("[METRIC DEPTH DEBUG] depth min:", float(d[valid].min()) if valid.any() else None)
-        print("[METRIC DEPTH DEBUG] depth max:", float(d[valid].max()) if valid.any() else None)
-        print("[METRIC DEPTH DEBUG] depth mean:", float(d[valid].mean()) if valid.any() else None)
-        print("[METRIC DEPTH DEBUG] depth median:", float(np.median(d[valid])) if valid.any() else None)
-        print("========================================\n")
-
-    except Exception as e:
-        print("[METRIC DEPTH DEBUG] failed:", repr(e))
 
 
 def _save_depth_map(depth_map: torch.Tensor, cfg: Dict, idx: int) -> None:

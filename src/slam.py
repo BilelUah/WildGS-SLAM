@@ -128,42 +128,75 @@ class SLAM:
         self.terminate()
 
     def backend(self):
-        self.printer.print("Final Global BA Triggered!", FontColor.TRACKER)
+        self.printer.print(
+            "Final Global BA Triggered!",
+            FontColor.TRACKER,
+        )
 
-        metric_depth_reg_activated = self.video.metric_depth_reg
+        metric_depth_reg_activated = (
+            self.video.metric_depth_reg
+        )
+
         if metric_depth_reg_activated:
             self.video.metric_depth_reg = False
 
-        self.ba = Backend(self.droid_net, self.video, self.cfg)
+        self.ba = Backend(
+            self.droid_net,
+            self.video,
+            self.cfg,
+        )
+
         torch.cuda.empty_cache()
+
         self.ba.dense_ba(7)
+
         torch.cuda.empty_cache()
+
         self.ba.dense_ba(12)
-        self.printer.print("Final Global BA Done!", FontColor.TRACKER)
+
+        self.printer.print(
+            "Final Global BA Done!",
+            FontColor.TRACKER,
+        )
 
         if metric_depth_reg_activated:
             self.video.metric_depth_reg = True
 
     def terminate(self):
-        """fill poses for non-keyframe images and evaluate"""
+        """Fill poses for non-keyframe images and evaluate."""
 
         if (
-            self.cfg["tracking"]["backend"]["final_ba"]
-            and self.cfg["mapping"]["eval_before_final_ba"]
+                self.cfg["tracking"]["backend"]["final_ba"]
+                and self.cfg["mapping"]["eval_before_final_ba"]
         ):
-            self.video.save_video(f"{self.save_dir}/video.npz")
+
+            self.video.save_video(
+                f"{self.save_dir}/video.npz"
+            )
+
             if not isinstance(self.stream, RGB_NoPose):
                 try:
-                    ate_statistics, global_scale, r_a, t_a = kf_traj_eval(
+                    (
+                        ate_statistics,
+                        global_scale,
+                        r_a,
+                        t_a,
+                    ) = kf_traj_eval(
                         f"{self.save_dir}/video.npz",
-                        f"{self.save_dir}/traj/before_final_ba",
+                        (
+                            f"{self.save_dir}/traj/"
+                            "before_final_ba"
+                        ),
                         "kf_traj",
                         self.stream,
                         self.logger,
                         self.printer,
                     )
                 except Exception as e:
-                    self.printer.print(e, FontColor.ERROR)
+                    self.printer.print(
+                        e,
+                        FontColor.ERROR,
+                    )
 
             self.mapper.save_all_kf_figs(
                 self.save_dir,
@@ -173,10 +206,18 @@ class SLAM:
         if self.cfg["tracking"]["backend"]["final_ba"]:
             self.backend()
 
-        self.video.save_video(f"{self.save_dir}/video.npz")
+        self.video.save_video(
+            f"{self.save_dir}/video.npz"
+        )
+
         if not isinstance(self.stream, RGB_NoPose):
             try:
-                ate_statistics, global_scale, r_a, t_a = kf_traj_eval(
+                (
+                    ate_statistics,
+                    global_scale,
+                    r_a,
+                    t_a,
+                ) = kf_traj_eval(
                     f"{self.save_dir}/video.npz",
                     f"{self.save_dir}/traj",
                     "kf_traj",
@@ -185,24 +226,33 @@ class SLAM:
                     self.printer,
                 )
             except Exception as e:
-                self.printer.print(e, FontColor.ERROR)
+                self.printer.print(
+                    e,
+                    FontColor.ERROR,
+                )
 
         if self.cfg["tracking"]["backend"]["final_ba"]:
             self.mapper.final_refine(
-                iters=self.cfg["mapping"]["final_refine_iters"]
-            )  # this performs a set of optimizations with RGBD loss to correct
+                iters=self.cfg[
+                    "mapping"
+                ]["final_refine_iters"]
+            )
 
-        # Evaluate the metrics
         self.mapper.save_all_kf_figs(
             self.save_dir,
             iteration="after_refine",
         )
 
-        ## Not used, see head comments of the function
-        # self._eval_depth_all(ate_statistics, global_scale, r_a, t_a)
+        # Not used, see head comments of the function.
+        # self._eval_depth_all(
+        #     ate_statistics,
+        #     global_scale,
+        #     r_a,
+        #     t_a,
+        # )
 
-        # Regenerate feature extractor for non-keyframes
         self.traj_filler.setup_feature_extractor()
+
         full_traj_eval(
             self.traj_filler,
             self.mapper,
@@ -211,18 +261,26 @@ class SLAM:
             self.stream,
             self.logger,
             self.printer,
-            self.cfg['fast_mode'],
+            self.cfg["fast_mode"],
         )
 
-        self.mapper.gaussians.save_ply(f"{self.save_dir}/final_gs.ply")
+        self.mapper.gaussians.save_ply(
+            f"{self.save_dir}/final_gs.ply"
+        )
 
         if self.cfg["mapping"]["uncertainty_params"]["activate"]:
             torch.save(
                 self.mapper.uncer_network.state_dict(),
-                self.save_dir + "/uncertainty_mlp_weight.pth",
+                (
+                        self.save_dir
+                        + "/uncertainty_mlp_weight.pth"
+                ),
             )
 
-        self.printer.print("Metrics Evaluation Done!", FontColor.EVAL)
+        self.printer.print(
+            "Metrics Evaluation Done!",
+            FontColor.EVAL,
+        )
 
     def _eval_depth_all(self, ate_statistics, global_scale, r_a, t_a):
         """From Splat-SLAM. Not used in WildGS-SLAM evaluation, but might be useful in the future."""

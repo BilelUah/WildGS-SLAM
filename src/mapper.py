@@ -1,12 +1,13 @@
 import os
+from contextlib import nullcontext
 import numpy as np
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import matplotlib
+
 matplotlib.use('Agg')
 import matplotlib.patches as patches
 from typing import Optional, Tuple, Union
-
 import cv2
 import torch
 import torch.nn as nn
@@ -46,6 +47,7 @@ from src.utils.dyn_uncertainty.median_filter import MedianPool2d
 from src.utils.plot_utils import create_gif_from_directory
 from src.gui import gui_utils
 
+
 class Mapper(object):
     """
     Mapper thread.
@@ -53,14 +55,18 @@ class Mapper(object):
     """
 
     def __init__(
-        self, slam, pipe: Connection, uncer_network: Optional[nn.Module] = None, 
-        q_main2vis: Optional[mp.Queue] = None, q_vis2main: Optional[mp.Queue] = None
+            self, slam, pipe: Connection, uncer_network: Optional[nn.Module] = None,
+            q_main2vis: Optional[mp.Queue] = None, q_vis2main: Optional[mp.Queue] = None
     ):
         # setup seed
         setup_seed(slam.cfg["setup_seed"])
         torch.autograd.set_detect_anomaly(True)
 
         self.config = slam.cfg
+
+        # The Navigator wrapper attaches the shared SimpleProfiler
+        # after the original Mapper object has been created.
+        self.profiler = None
         self.printer: Printer = slam.printer
         self.pipe = pipe
         self.verbose = slam.verbose
@@ -146,6 +152,29 @@ class Mapper(object):
         self.q_vis2main = q_vis2main
         self.pause = False
 
+
+    # =========================================================
+    # SimpleProfiler helpers
+    # =========================================================
+
+    def _profile_timer(self, name: str):
+        """
+        Return a real profiler timer when the wrapper attached one.
+
+        Otherwise, nullcontext() does nothing and the original Mapper
+        operation runs normally.
+        """
+        profiler = getattr(
+            self,
+            "profiler",
+            None,
+        )
+
+        if profiler is None:
+            return nullcontext()
+
+        return profiler.timer(name)
+
     def run(self):
         """
         Trigger mapping process, get estimated pose and depth from tracking process,
@@ -171,7 +200,10 @@ class Mapper(object):
                     else:
                         self.printer.print("You have resume the process", FontColor.MAPPER)
 
-            frame_info = self.pipe.recv()
+            with self._profile_timer(
+                "wildgs.mapper.run.receive_frame_info"
+            ):
+                frame_info = self.pipe.recv()
             frame_idx, video_idx = frame_info["timestamp"], frame_info["video_idx"]
             is_init, is_finished = frame_info["just_initialized"], frame_info["end"]
 
@@ -184,11 +216,17 @@ class Mapper(object):
 
             if is_init:
                 self.printer.print("Initializing the mapping", FontColor.MAPPER)
-                self.initialize_mapper(video_idx)
+                with self._profile_timer(
+                    "wildgs.mapper.run.initialize_mapper"
+                ):
+                    self.initialize_mapper(video_idx)
                 self.pipe.send("continue")
                 continue
 
-            viewpoint, invalid = self._get_viewpoint(video_idx, frame_idx)
+            with self._profile_timer(
+                "wildgs.mapper.run.get_viewpoint"
+            ):
+                viewpoint, invalid = self._get_viewpoint(video_idx, frame_idx)
 
             if invalid:
                 # Only happens when not using metric depth for tracking regularization
@@ -196,60 +234,46 @@ class Mapper(object):
                 self.is_kf[video_idx] = False
                 self.pipe.send("continue")
                 continue  # too few valid pixels from droid depth
-            
+
             # Update the map if depth/pose of any keyframe has been updated
-            self._update_keyframes_from_frontend()
+            with self._profile_timer(
+                "wildgs.mapper.run.update_keyframes_from_frontend"
+            ):
+                self._update_keyframes_from_frontend()
             self.frame_idxs.append(frame_idx)
             self.video_idxs.append(video_idx)
 
             # We need to render from the current pose to obtain the "n_touched" variable
             # which is used later on
-            render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
-            )
+            with self._profile_timer(
+                "wildgs.mapper.run.visibility_render"
+            ):
+                render_pkg = render(
+                    viewpoint, self.gaussians, self.pipeline_params, self.background
+                )
             curr_visibility = (render_pkg["n_touched"] > 0).long()
 
             # Always create kf
             self.cameras[video_idx] = viewpoint
-            self.current_window, _ = self._add_to_window(
-                video_idx,
-                curr_visibility,
-                self.occ_aware_visibility,
-                self.current_window,
-            )
+            with self._profile_timer(
+                "wildgs.mapper.run.add_to_window"
+            ):
+                self.current_window, _ = self._add_to_window(
+                    video_idx,
+                    curr_visibility,
+                    self.occ_aware_visibility,
+                    self.current_window,
+                )
             self.is_kf[video_idx] = True
             self.depth_dict[video_idx] = torch.tensor(viewpoint.depth).to(self.device)
             self.frame_count_log[video_idx] = 0
 
-            if int(frame_idx) in [98, 107, 116, 125, 134]:
-                xyz_before_insert = self.gaussians.get_xyz.detach()
-                print("\n========== ORIG INSERT DEBUG BEFORE ==========")
-                print("[ORIG INSERT] frame_idx:", frame_idx)
-                print("[ORIG INSERT] video_idx:", video_idx)
-                print("[ORIG INSERT] n_gauss before insert:", int(xyz_before_insert.shape[0]))
-                print("[ORIG INSERT] xyz min before:",
-                      xyz_before_insert.min(dim=0).values.detach().cpu().numpy())
-                print("[ORIG INSERT] xyz max before:",
-                      xyz_before_insert.max(dim=0).values.detach().cpu().numpy())
-                print("==============================================\n")
-
-            self.gaussians.extend_from_pcd_seq(
-                viewpoint, kf_id=video_idx, init=False, depthmap=viewpoint.depth
-            )
-
-            if int(frame_idx) in [98, 107, 116, 125, 134]:
-                xyz_after_insert = self.gaussians.get_xyz.detach()
-                print("\n========== ORIG INSERT DEBUG AFTER ==========")
-                print("[ORIG INSERT] frame_idx:", frame_idx)
-                print("[ORIG INSERT] video_idx:", video_idx)
-                print("[ORIG INSERT] n_gauss after insert:", int(xyz_after_insert.shape[0]))
-                print("[ORIG INSERT] delta:",
-                      int(xyz_after_insert.shape[0]) - int(xyz_before_insert.shape[0]))
-                print("[ORIG INSERT] xyz min after:",
-                      xyz_after_insert.min(dim=0).values.detach().cpu().numpy())
-                print("[ORIG INSERT] xyz max after:",
-                      xyz_after_insert.max(dim=0).values.detach().cpu().numpy())
-                print("=============================================\n")
+            with self._profile_timer(
+                "wildgs.mapper.run.gaussian_insert"
+            ):
+                self.gaussians.extend_from_pcd_seq(
+                    viewpoint, kf_id=video_idx, init=False, depthmap=viewpoint.depth
+                )
 
             opt_params = []
             for cam_idx in range(len(self.current_window)):
@@ -271,76 +295,54 @@ class Mapper(object):
                         "name": "exposure_b_{}".format(viewpoint.uid),
                     }
                 )
-            self.keyframe_optimizers = torch.optim.Adam(opt_params)
+            with self._profile_timer(
+                "wildgs.mapper.run.create_keyframe_optimizer"
+            ):
+                self.keyframe_optimizers = torch.optim.Adam(opt_params)
 
             with Lock():
-                debug_online_frames = {107, 116, 125, 134, 143, 152}
 
-                if int(frame_idx) in debug_online_frames:
-                    with torch.no_grad():
-                        xyz_pre_opt = self.gaussians.get_xyz.detach()
-
-                        print("\n========== ORIG MAP OPT DEBUG BEFORE ==========")
-                        print("[ORIG MAP OPT] frame_idx:", frame_idx)
-                        print("[ORIG MAP OPT] video_idx:", video_idx)
-                        print("[ORIG MAP OPT] current_window:", self.current_window)
-                        print("[ORIG MAP OPT] n_gauss before opt:", int(xyz_pre_opt.shape[0]))
-                        print("[ORIG MAP OPT] xyz min before:",
-                              xyz_pre_opt.min(dim=0).values.detach().cpu().numpy())
-                        print("[ORIG MAP OPT] xyz max before:",
-                              xyz_pre_opt.max(dim=0).values.detach().cpu().numpy())
-                        print("================================================\n")
-
-                if self.config['fast_mode']:
+                if self.config["fast_mode"]:
                     if video_idx % 4 == 0:
-                        gaussian_split = self.map_opt_online(
-                            self.current_window, iters=self.mapping_itr_num
-                        )
+                        with self._profile_timer(
+                            "wildgs.mapper.run.map_opt_online"
+                        ):
+                            gaussian_split = self.map_opt_online(
+                                self.current_window,
+                                iters=self.mapping_itr_num,
+                            )
                     else:
-                        self._update_occ_aware_visibility(self.current_window)
+                        with self._profile_timer(
+                            "wildgs.mapper.run.visibility_only_update"
+                        ):
+                            self._update_occ_aware_visibility(
+                                self.current_window
+                            )
                         gaussian_split = False
                 else:
-                    gaussian_split = self.map_opt_online(
-                        self.current_window, iters=self.mapping_itr_num
-                    )
-
-                if int(frame_idx) in debug_online_frames:
-                    with torch.no_grad():
-                        xyz_post_opt = self.gaussians.get_xyz.detach()
-
-                        print("\n========== ORIG MAP OPT DEBUG AFTER ==========")
-                        print("[ORIG MAP OPT] frame_idx:", frame_idx)
-                        print("[ORIG MAP OPT] video_idx:", video_idx)
-                        print("[ORIG MAP OPT] gaussian_split:", gaussian_split)
-                        print("[ORIG MAP OPT] n_gauss after opt:", int(xyz_post_opt.shape[0]))
-                        print("[ORIG MAP OPT] xyz min after:",
-                              xyz_post_opt.min(dim=0).values.detach().cpu().numpy())
-                        print("[ORIG MAP OPT] xyz max after:",
-                              xyz_post_opt.max(dim=0).values.detach().cpu().numpy())
-                        print("==============================================\n")
+                    with self._profile_timer(
+                        "wildgs.mapper.run.map_opt_online"
+                    ):
+                        gaussian_split = self.map_opt_online(
+                            self.current_window,
+                            iters=self.mapping_itr_num,
+                        )
 
                 if gaussian_split:
-                    if int(frame_idx) in debug_online_frames:
-                        print("[ORIG MAP OPT] running extra 1 iteration after gaussian_split")
+                    with self._profile_timer(
+                        "wildgs.mapper.run.extra_opt_after_split"
+                    ):
+                        self.map_opt_online(
+                            self.current_window,
+                            iters=1,
+                        )
 
-                    self.map_opt_online(self.current_window, iters=1)
+            with self._profile_timer(
+                "wildgs.mapper.run.empty_cuda_cache"
+            ):
+                torch.cuda.empty_cache()
 
-                    if int(frame_idx) in debug_online_frames:
-                        with torch.no_grad():
-                            xyz_extra = self.gaussians.get_xyz.detach()
-
-                            print("\n========== ORIG MAP OPT DEBUG AFTER EXTRA ==========")
-                            print("[ORIG MAP OPT] frame_idx:", frame_idx)
-                            print("[ORIG MAP OPT] video_idx:", video_idx)
-                            print("[ORIG MAP OPT] n_gauss after extra:", int(xyz_extra.shape[0]))
-                            print("[ORIG MAP OPT] xyz min after extra:",
-                                  xyz_extra.min(dim=0).values.detach().cpu().numpy())
-                            print("[ORIG MAP OPT] xyz max after extra:",
-                                  xyz_extra.max(dim=0).values.detach().cpu().numpy())
-                            print("====================================================\n")
-            torch.cuda.empty_cache()
-
-            if self.config['gui']:
+            if self.config["gui"]:
                 self._send_to_gui(video_idx)
 
             self.pipe.send("continue")
@@ -358,7 +360,7 @@ class Mapper(object):
         self.init_gaussian_reset = mapping_config["Training"]["init_gaussian_reset"]
         self.init_gaussian_th = mapping_config["Training"]["init_gaussian_th"]
         self.init_gaussian_extent = (
-            self.cameras_extent * mapping_config["Training"]["init_gaussian_extent"]
+                self.cameras_extent * mapping_config["Training"]["init_gaussian_extent"]
         )
         self.mapping_itr_num = mapping_config["Training"]["mapping_itr_num"]
         self.gaussian_update_every = mapping_config["Training"]["gaussian_update_every"]
@@ -367,7 +369,7 @@ class Mapper(object):
         ]
         self.gaussian_th = mapping_config["Training"]["gaussian_th"]
         self.gaussian_extent = (
-            self.cameras_extent * mapping_config["Training"]["gaussian_extent"]
+                self.cameras_extent * mapping_config["Training"]["gaussian_extent"]
         )
         self.gaussian_reset = mapping_config["Training"]["gaussian_reset"]
         self.size_threshold = mapping_config["Training"]["size_threshold"]
@@ -390,57 +392,60 @@ class Mapper(object):
             Tuple[Camera, bool]: Initialized Camera object and an invalid flag.
         """
         # Load color image based on resolution configuration
-        if self.config["mapping"]["full_resolution"]:
-            color = (
-                self.frame_reader.get_color_full_resol(frame_idx)
-                .to(self.device)
-                .squeeze()
+        with self._profile_timer(
+            "wildgs.mapper.get_viewpoint.total"
+        ):
+            if self.config["mapping"]["full_resolution"]:
+                color = (
+                    self.frame_reader.get_color_full_resol(frame_idx)
+                    .to(self.device)
+                    .squeeze()
+                )
+                load_feature_suffix = "full"
+            else:
+                color = self.frame_reader.get_color(frame_idx).to(self.device).squeeze()
+                load_feature_suffix = ""
+
+            # Load metric depth
+            metric_depth = load_metric_depth(frame_idx, self.save_dir).to(self.device)
+
+            # Load features if uncertainty-aware
+            if self.uncertainty_aware:
+                features = load_img_feature(
+                    frame_idx, self.save_dir, suffix=load_feature_suffix
+                ).to(self.device)
+            else:
+                features = None
+
+            # Get estimated depth and camera pose
+            est_depth, est_w2c, invalid = self.get_w2c_and_depth(
+                video_idx, frame_idx, metric_depth
             )
-            load_feature_suffix = "full"
-        else:
-            color = self.frame_reader.get_color(frame_idx).to(self.device).squeeze()
-            load_feature_suffix = ""
 
-        # Load metric depth
-        metric_depth = load_metric_depth(frame_idx, self.save_dir).to(self.device)
+            # Prepare data dictionary for Camera initialization
+            camera_data = {
+                "idx": video_idx,
+                "gt_color": color,
+                "est_depth": est_depth.cpu().numpy(),
+                "est_pose": est_w2c,
+                "features": features,
+            }
 
-        # Load features if uncertainty-aware
-        if self.uncertainty_aware:
-            features = load_img_feature(
-                frame_idx, self.save_dir, suffix=load_feature_suffix
-            ).to(self.device)
-        else:
-            features = None
+            # Initialize Camera object
+            viewpoint = Camera.init_from_dataset(
+                self.frame_reader,
+                camera_data,
+                self.projection_matrix,
+                full_resol=self.config["mapping"]["full_resolution"],
+            )
 
-        # Get estimated depth and camera pose
-        est_depth, est_w2c, invalid = self.get_w2c_and_depth(
-            video_idx, frame_idx, metric_depth
-        )
+            # Update camera pose and compute gradient mask
+            # The Camera class is based on MonoGS and
+            # init_from_dataset function only updates the ground truth pose
+            viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
+            viewpoint.compute_grad_mask(self.config)
 
-        # Prepare data dictionary for Camera initialization
-        camera_data = {
-            "idx": video_idx,
-            "gt_color": color,
-            "est_depth": est_depth.cpu().numpy(),
-            "est_pose": est_w2c,
-            "features": features,
-        }
-
-        # Initialize Camera object
-        viewpoint = Camera.init_from_dataset(
-            self.frame_reader,
-            camera_data,
-            self.projection_matrix,
-            full_resol=self.config["mapping"]["full_resolution"],
-        )
-
-        # Update camera pose and compute gradient mask
-        # The Camera class is based on MonoGS and
-        # init_from_dataset function only updates the ground truth pose
-        viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
-        viewpoint.compute_grad_mask(self.config)
-
-        return viewpoint, invalid
+            return viewpoint, invalid
 
     def _update_keyframes_from_frontend(self):
         """
@@ -448,512 +453,527 @@ class Mapper(object):
         This includes updating camera poses, depths, and mapping points (deform gaussians)
         for all keyframes.
         """
-        for keyframe_idx, frame_idx in zip(self.video_idxs, self.frame_idxs):
-            # Get updated pose and depth
-            if self.video.metric_depth_reg:
-                c2w_updated = self.video.get_pose(keyframe_idx, self.device)
-                w2c_updated = torch.linalg.inv(c2w_updated)
-                depth_updated = None
-                invalid = False
-            else:
-                metric_depth = load_metric_depth(frame_idx, self.save_dir).to(
-                    self.device
-                )
-                depth_updated, w2c_updated, invalid = self.get_w2c_and_depth(
-                    keyframe_idx, frame_idx, metric_depth
-                )
+        with self._profile_timer(
+            "wildgs.mapper.update_keyframes_from_frontend.total"
+        ):
+            for keyframe_idx, frame_idx in zip(self.video_idxs, self.frame_idxs):
+                # Get updated pose and depth
+                if self.video.metric_depth_reg:
+                    c2w_updated = self.video.get_pose(keyframe_idx, self.device)
+                    w2c_updated = torch.linalg.inv(c2w_updated)
+                    depth_updated = None
+                    invalid = False
+                else:
+                    metric_depth = load_metric_depth(frame_idx, self.save_dir).to(
+                        self.device
+                    )
+                    depth_updated, w2c_updated, invalid = self.get_w2c_and_depth(
+                        keyframe_idx, frame_idx, metric_depth
+                    )
 
-            # Get old pose
-            w2c_old = torch.eye(4, device=self.device)
-            w2c_old[:3, :3] = self.cameras[keyframe_idx].R
-            w2c_old[:3, 3] = self.cameras[keyframe_idx].T
+                # Get old pose
+                w2c_old = torch.eye(4, device=self.device)
+                w2c_old[:3, :3] = self.cameras[keyframe_idx].R
+                w2c_old[:3, 3] = self.cameras[keyframe_idx].T
 
-            pose_unchanged = torch.allclose(w2c_old, w2c_updated, atol=1e-6)
-            if pose_unchanged and depth_updated is None:
-                continue
+                pose_unchanged = torch.allclose(w2c_old, w2c_updated, atol=1e-6)
+                if pose_unchanged and depth_updated is None:
+                    continue
 
-            # Update camera
-            self.cameras[keyframe_idx].update_RT(
-                w2c_updated[:3, :3], w2c_updated[:3, 3]
-            )
-            if depth_updated is not None:
-                self.cameras[keyframe_idx].depth = depth_updated.cpu().numpy()
-                self.depth_dict[keyframe_idx] = depth_updated
-
-            # Update viewpoint if it exists
-            if self.is_kf[keyframe_idx]:
+                # Update camera
                 self.cameras[keyframe_idx].update_RT(
                     w2c_updated[:3, :3], w2c_updated[:3, 3]
                 )
                 if depth_updated is not None:
                     self.cameras[keyframe_idx].depth = depth_updated.cpu().numpy()
+                    self.depth_dict[keyframe_idx] = depth_updated
 
-            # Update mapping parameters
-            if self.deform_gaussians and self.is_kf[keyframe_idx]:
-                if invalid or depth_updated is None:
-                    self._update_mapping_points(
-                        keyframe_idx,
-                        w2c_updated,
-                        w2c_old,
-                        depth_updated,
-                        self.depth_dict[keyframe_idx],
-                        method="rigid",
+                # Update viewpoint if it exists
+                if self.is_kf[keyframe_idx]:
+                    self.cameras[keyframe_idx].update_RT(
+                        w2c_updated[:3, :3], w2c_updated[:3, 3]
                     )
-                else:
-                    self._update_mapping_points(
-                        keyframe_idx,
-                        w2c_updated,
-                        w2c_old,
-                        depth_updated,
-                        self.depth_dict[keyframe_idx],
-                    )
+                    if depth_updated is not None:
+                        self.cameras[keyframe_idx].depth = depth_updated.cpu().numpy()
+
+                # Update mapping parameters
+                if self.deform_gaussians and self.is_kf[keyframe_idx]:
+                    if invalid or depth_updated is None:
+                        self._update_mapping_points(
+                            keyframe_idx,
+                            w2c_updated,
+                            w2c_old,
+                            depth_updated,
+                            self.depth_dict[keyframe_idx],
+                            method="rigid",
+                        )
+                    else:
+                        self._update_mapping_points(
+                            keyframe_idx,
+                            w2c_updated,
+                            w2c_old,
+                            depth_updated,
+                            self.depth_dict[keyframe_idx],
+                        )
 
     def _update_mapping_points(
-        self, frame_idx, w2c, w2c_old, depth, depth_old, method=None
+            self, frame_idx, w2c, w2c_old, depth, depth_old, method=None
     ):
         """Refer to splat-slam"""
-        if method == "rigid":
-            # just move the points according to their SE(3) transformation without updating depth
-            frame_idxs = (
-                self.gaussians.unique_kfIDs
-            )  # idx which anchored the set of points
-            frame_mask = frame_idxs == frame_idx  # global variable
-            if frame_mask.sum() == 0:
-                return
-            # Retrieve current set of points to be deformed
-            # But first we need to retrieve all mean locations and clone them
-            means = self.gaussians.get_xyz.detach()
-            # Then move the points to their new location according to the new pose
-            # The global transformation can be computed by composing the old pose
-            # with the new pose
-            transformation = torch.linalg.inv(torch.linalg.inv(w2c_old) @ w2c)
-            pix_ones = torch.ones(frame_mask.sum(), 1).cuda().float()
-            pts4 = torch.cat((means[frame_mask], pix_ones), dim=1)
-            means[frame_mask] = (transformation @ pts4.T).T[:, :3]
-            # put the new means back to the optimizer
-            self.gaussians._xyz = self.gaussians.replace_tensor_to_optimizer(
-                means, "xyz"
-            )["xyz"]
-            # transform the corresponding rotation matrices
-            rots = self.gaussians.get_rotation.detach()
-            # Convert transformation to quaternion
-            transformation = rotation_matrix_to_quaternion(transformation.unsqueeze(0))
-            rots[frame_mask] = quaternion_multiply(
-                transformation.expand_as(rots[frame_mask]), rots[frame_mask]
-            )
+        with self._profile_timer(
+            "wildgs.mapper.update_mapping_points.total"
+        ):
+            if method == "rigid":
+                # just move the points according to their SE(3) transformation without updating depth
+                frame_idxs = (
+                    self.gaussians.unique_kfIDs
+                )  # idx which anchored the set of points
+                frame_mask = frame_idxs == frame_idx  # global variable
+                if frame_mask.sum() == 0:
+                    return
+                # Retrieve current set of points to be deformed
+                # But first we need to retrieve all mean locations and clone them
+                means = self.gaussians.get_xyz.detach()
+                # Then move the points to their new location according to the new pose
+                # The global transformation can be computed by composing the old pose
+                # with the new pose
+                transformation = torch.linalg.inv(torch.linalg.inv(w2c_old) @ w2c)
+                pix_ones = torch.ones(frame_mask.sum(), 1).cuda().float()
+                pts4 = torch.cat((means[frame_mask], pix_ones), dim=1)
+                means[frame_mask] = (transformation @ pts4.T).T[:, :3]
+                # put the new means back to the optimizer
+                self.gaussians._xyz = self.gaussians.replace_tensor_to_optimizer(
+                    means, "xyz"
+                )["xyz"]
+                # transform the corresponding rotation matrices
+                rots = self.gaussians.get_rotation.detach()
+                # Convert transformation to quaternion
+                transformation = rotation_matrix_to_quaternion(transformation.unsqueeze(0))
+                rots[frame_mask] = quaternion_multiply(
+                    transformation.expand_as(rots[frame_mask]), rots[frame_mask]
+                )
 
-            with torch.no_grad():
+                with torch.no_grad():
+                    self.gaussians._rotation = self.gaussians.replace_tensor_to_optimizer(
+                        rots, "rotation"
+                    )["rotation"]
+            else:
+                # Update pose and depth by projecting points into the pixel space to find updated correspondences.
+                # This strategy also adjusts the scale of the gaussians to account for the distance change from the camera
+                depth = depth.to(self.device)
+                frame_idxs = (
+                    self.gaussians.unique_kfIDs
+                )  # idx which anchored the set of points
+                frame_mask = frame_idxs == frame_idx  # global variable
+                if frame_mask.sum() == 0:
+                    return
+
+                # Retrieve current set of points to be deformed
+                means = self.gaussians.get_xyz.detach()[frame_mask]
+
+                # Project the current means into the old camera to get the pixel locations
+                pix_ones = torch.ones(means.shape[0], 1).cuda().float()
+                pts4 = torch.cat((means, pix_ones), dim=1)
+                pixel_locations = (self.intrinsics @ (w2c_old @ pts4.T)[:3, :]).T
+                pixel_locations[:, 0] /= pixel_locations[:, 2]
+                pixel_locations[:, 1] /= pixel_locations[:, 2]
+                pixel_locations = pixel_locations[:, :2].long()
+                height, width = depth.shape
+                # Some pixels may project outside the viewing frustum.
+                # Assign these pixels the depth of the closest border pixel
+                pixel_locations[:, 0] = torch.clamp(
+                    pixel_locations[:, 0], min=0, max=width - 1
+                )
+                pixel_locations[:, 1] = torch.clamp(
+                    pixel_locations[:, 1], min=0, max=height - 1
+                )
+
+                # Extract the depth at those pixel locations from the new depth
+                depth = depth[pixel_locations[:, 1], pixel_locations[:, 0]]
+                depth_old = depth_old[pixel_locations[:, 1], pixel_locations[:, 0]]
+                # Next, we can either move the points to the new pose and then adjust the
+                # depth or the other way around.
+                # Lets adjust the depth per point first
+                # First we need to transform the global means into the old camera frame
+                pix_ones = torch.ones(frame_mask.sum(), 1).cuda().float()
+                pts4 = torch.cat((means, pix_ones), dim=1)
+                means_cam = (w2c_old @ pts4.T).T[:, :3]
+
+                rescale_scale = (1 + 1 / (means_cam[:, 2]) * (depth - depth_old)).unsqueeze(
+                    -1
+                )  # shift
+                # account for 0 depth values - then just do rigid deformation
+                rigid_mask = torch.logical_or(depth == 0, depth_old == 0)
+                rescale_scale[rigid_mask] = 1
+                if (rescale_scale <= 0.0).sum() > 0:
+                    rescale_scale[rescale_scale <= 0.0] = 1
+
+                rescale_mean = rescale_scale.repeat(1, 3)
+                means_cam = rescale_mean * means_cam
+
+                # Transform back means_cam to the world space
+                pts4 = torch.cat((means_cam, pix_ones), dim=1)
+                means = (torch.linalg.inv(w2c_old) @ pts4.T).T[:, :3]
+
+                # Then move the points to their new location according to the new pose
+                # The global transformation can be computed by composing the old pose
+                # with the new pose
+                transformation = torch.linalg.inv(torch.linalg.inv(w2c_old) @ w2c)
+                pts4 = torch.cat((means, pix_ones), dim=1)
+                means = (transformation @ pts4.T).T[:, :3]
+
+                # reassign the new means of the frame mask to the self.gaussian object
+                global_means = self.gaussians.get_xyz.detach()
+                global_means[frame_mask] = means
+                # print("mean nans: ", global_means.isnan().sum()/global_means.numel())
+                self.gaussians._xyz = self.gaussians.replace_tensor_to_optimizer(
+                    global_means, "xyz"
+                )["xyz"]
+
+                # update the rotation of the gaussians
+                rots = self.gaussians.get_rotation.detach()
+                # Convert transformation to quaternion
+                transformation = rotation_matrix_to_quaternion(transformation.unsqueeze(0))
+                rots[frame_mask] = quaternion_multiply(
+                    transformation.expand_as(rots[frame_mask]), rots[frame_mask]
+                )
                 self.gaussians._rotation = self.gaussians.replace_tensor_to_optimizer(
                     rots, "rotation"
                 )["rotation"]
-        else:
-            # Update pose and depth by projecting points into the pixel space to find updated correspondences.
-            # This strategy also adjusts the scale of the gaussians to account for the distance change from the camera
-            depth = depth.to(self.device)
-            frame_idxs = (
-                self.gaussians.unique_kfIDs
-            )  # idx which anchored the set of points
-            frame_mask = frame_idxs == frame_idx  # global variable
-            if frame_mask.sum() == 0:
-                return
 
-            # Retrieve current set of points to be deformed
-            means = self.gaussians.get_xyz.detach()[frame_mask]
-
-            # Project the current means into the old camera to get the pixel locations
-            pix_ones = torch.ones(means.shape[0], 1).cuda().float()
-            pts4 = torch.cat((means, pix_ones), dim=1)
-            pixel_locations = (self.intrinsics @ (w2c_old @ pts4.T)[:3, :]).T
-            pixel_locations[:, 0] /= pixel_locations[:, 2]
-            pixel_locations[:, 1] /= pixel_locations[:, 2]
-            pixel_locations = pixel_locations[:, :2].long()
-            height, width = depth.shape
-            # Some pixels may project outside the viewing frustum.
-            # Assign these pixels the depth of the closest border pixel
-            pixel_locations[:, 0] = torch.clamp(
-                pixel_locations[:, 0], min=0, max=width - 1
-            )
-            pixel_locations[:, 1] = torch.clamp(
-                pixel_locations[:, 1], min=0, max=height - 1
-            )
-
-            # Extract the depth at those pixel locations from the new depth
-            depth = depth[pixel_locations[:, 1], pixel_locations[:, 0]]
-            depth_old = depth_old[pixel_locations[:, 1], pixel_locations[:, 0]]
-            # Next, we can either move the points to the new pose and then adjust the
-            # depth or the other way around.
-            # Lets adjust the depth per point first
-            # First we need to transform the global means into the old camera frame
-            pix_ones = torch.ones(frame_mask.sum(), 1).cuda().float()
-            pts4 = torch.cat((means, pix_ones), dim=1)
-            means_cam = (w2c_old @ pts4.T).T[:, :3]
-
-            rescale_scale = (1 + 1 / (means_cam[:, 2]) * (depth - depth_old)).unsqueeze(
-                -1
-            )  # shift
-            # account for 0 depth values - then just do rigid deformation
-            rigid_mask = torch.logical_or(depth == 0, depth_old == 0)
-            rescale_scale[rigid_mask] = 1
-            if (rescale_scale <= 0.0).sum() > 0:
-                rescale_scale[rescale_scale <= 0.0] = 1
-
-            rescale_mean = rescale_scale.repeat(1, 3)
-            means_cam = rescale_mean * means_cam
-
-            # Transform back means_cam to the world space
-            pts4 = torch.cat((means_cam, pix_ones), dim=1)
-            means = (torch.linalg.inv(w2c_old) @ pts4.T).T[:, :3]
-
-            # Then move the points to their new location according to the new pose
-            # The global transformation can be computed by composing the old pose
-            # with the new pose
-            transformation = torch.linalg.inv(torch.linalg.inv(w2c_old) @ w2c)
-            pts4 = torch.cat((means, pix_ones), dim=1)
-            means = (transformation @ pts4.T).T[:, :3]
-
-            # reassign the new means of the frame mask to the self.gaussian object
-            global_means = self.gaussians.get_xyz.detach()
-            global_means[frame_mask] = means
-            # print("mean nans: ", global_means.isnan().sum()/global_means.numel())
-            self.gaussians._xyz = self.gaussians.replace_tensor_to_optimizer(
-                global_means, "xyz"
-            )["xyz"]
-
-            # update the rotation of the gaussians
-            rots = self.gaussians.get_rotation.detach()
-            # Convert transformation to quaternion
-            transformation = rotation_matrix_to_quaternion(transformation.unsqueeze(0))
-            rots[frame_mask] = quaternion_multiply(
-                transformation.expand_as(rots[frame_mask]), rots[frame_mask]
-            )
-            self.gaussians._rotation = self.gaussians.replace_tensor_to_optimizer(
-                rots, "rotation"
-            )["rotation"]
-
-            # Update the scale of the Gaussians
-            scales = self.gaussians._scaling.detach()
-            scales[frame_mask] = scales[frame_mask] + torch.log(rescale_scale)
-            self.gaussians._scaling = self.gaussians.replace_tensor_to_optimizer(
-                scales, "scaling"
-            )["scaling"]
+                # Update the scale of the Gaussians
+                scales = self.gaussians._scaling.detach()
+                scales[frame_mask] = scales[frame_mask] + torch.log(rescale_scale)
+                self.gaussians._scaling = self.gaussians.replace_tensor_to_optimizer(
+                    scales, "scaling"
+                )["scaling"]
 
     def _update_occ_aware_visibility(self, current_window):
-        self.occ_aware_visibility = {}
-        for kf_idx in current_window:
-            viewpoint = self.cameras[kf_idx]
-            render_pkg = render(
-                viewpoint,
-                self.gaussians,
-                self.pipeline_params,
-                self.background,
-            )
-            self.occ_aware_visibility[kf_idx] = (
-                render_pkg["n_touched"] > 0
-            ).long()
+        with self._profile_timer(
+            "wildgs.mapper.update_visibility.total"
+        ):
+            self.occ_aware_visibility = {}
+            for kf_idx in current_window:
+                viewpoint = self.cameras[kf_idx]
+                with self._profile_timer(
+                    "wildgs.mapper.update_visibility.render"
+                ):
+                    render_pkg = render(
+                        viewpoint,
+                        self.gaussians,
+                        self.pipeline_params,
+                        self.background,
+                    )
+                self.occ_aware_visibility[kf_idx] = (
+                        render_pkg["n_touched"] > 0
+                ).long()
 
     def get_w2c_and_depth(self, video_idx, idx, mono_depth, print_info=False):
-        est_frontend_depth, valid_depth_mask, c2w = self.video.get_depth_and_pose(
-            video_idx, self.device
-        )
-        c2w = c2w.to(self.device)
-        w2c = torch.linalg.inv(c2w)
-
-        if self.video.metric_depth_reg:
-            return est_frontend_depth, w2c, False
-
-        # The following is only useful when no metric depth used for tracking regularization
-        # Code is from Splat-SLAM
-        if print_info:
-            self.printer.print(
-                f"valid depth number: {valid_depth_mask.sum().item()}, "
-                f"valid depth ratio: {(valid_depth_mask.sum()/(valid_depth_mask.shape[0]*valid_depth_mask.shape[1])).item()}",
-                FontColor.MAPPER
+        with self._profile_timer(
+            "wildgs.mapper.get_w2c_and_depth.total"
+        ):
+            est_frontend_depth, valid_depth_mask, c2w = self.video.get_depth_and_pose(
+                video_idx, self.device
             )
+            c2w = c2w.to(self.device)
+            w2c = torch.linalg.inv(c2w)
 
-        if valid_depth_mask.sum() < 100:
-            invalid = True
-            self.printer.print(
-                f"Skip mapping frame {idx} at video idx {video_idx} because of not enough valid depth ({valid_depth_mask.sum()}).", FontColor.MAPPER
-            )
-        else:
-            invalid = False
+            if self.video.metric_depth_reg:
+                return est_frontend_depth, w2c, False
 
-        est_frontend_depth[~valid_depth_mask] = 0
-        if not invalid:
-            mono_depth[mono_depth > 4 * mono_depth.mean()] = 0
-            mono_depth = mono_depth.cpu().numpy()
-            binary_image = (mono_depth > 0).astype(int)
-            # Add padding around the binary_image to protect the borders
-            iterations = 5
-            padded_binary_image = np.pad(
-                binary_image, pad_width=iterations, mode="constant", constant_values=1
-            )
-            structure = np.ones((3, 3), dtype=int)
-            # Apply binary erosion with padding
-            eroded_padded_image = binary_erosion(
-                padded_binary_image, structure=structure, iterations=iterations
-            )
-            # Remove padding after erosion
-            eroded_image = eroded_padded_image[
-                iterations:-iterations, iterations:-iterations
-            ]
-            # set mono depth to zero at mask
-            mono_depth[eroded_image == 0] = 0
+            # The following is only useful when no metric depth used for tracking regularization
+            # Code is from Splat-SLAM
+            if print_info:
+                self.printer.print(
+                    f"valid depth number: {valid_depth_mask.sum().item()}, "
+                    f"valid depth ratio: {(valid_depth_mask.sum() / (valid_depth_mask.shape[0] * valid_depth_mask.shape[1])).item()}",
+                    FontColor.MAPPER
+                )
 
-            if (mono_depth == 0).sum() > 0:
-                mono_depth = torch.from_numpy(
-                    cv2.inpaint(
-                        mono_depth,
-                        (mono_depth == 0).astype(np.uint8),
-                        inpaintRadius=3,
-                        flags=cv2.INPAINT_NS,
-                    )
-                ).to(self.device)
+            if valid_depth_mask.sum() < 100:
+                invalid = True
+                self.printer.print(
+                    f"Skip mapping frame {idx} at video idx {video_idx} because of not enough valid depth ({valid_depth_mask.sum()}).",
+                    FontColor.MAPPER
+                )
             else:
-                mono_depth = torch.from_numpy(mono_depth).to(self.device)
+                invalid = False
 
-            valid_mask = (
-                torch.from_numpy(eroded_image).to(self.device) * valid_depth_mask
-            )  # new
+            est_frontend_depth[~valid_depth_mask] = 0
+            if not invalid:
+                mono_depth[mono_depth > 4 * mono_depth.mean()] = 0
+                mono_depth = mono_depth.cpu().numpy()
+                binary_image = (mono_depth > 0).astype(int)
+                # Add padding around the binary_image to protect the borders
+                iterations = 5
+                padded_binary_image = np.pad(
+                    binary_image, pad_width=iterations, mode="constant", constant_values=1
+                )
+                structure = np.ones((3, 3), dtype=int)
+                # Apply binary erosion with padding
+                eroded_padded_image = binary_erosion(
+                    padded_binary_image, structure=structure, iterations=iterations
+                )
+                # Remove padding after erosion
+                eroded_image = eroded_padded_image[
+                    iterations:-iterations, iterations:-iterations
+                ]
+                # set mono depth to zero at mask
+                mono_depth[eroded_image == 0] = 0
 
-            cur_wq = self.video.get_depth_scale_and_shift(
-                video_idx, mono_depth, est_frontend_depth, valid_mask
-            )
-            mono_depth_wq = mono_depth * cur_wq[0] + cur_wq[1]
+                if (mono_depth == 0).sum() > 0:
+                    mono_depth = torch.from_numpy(
+                        cv2.inpaint(
+                            mono_depth,
+                            (mono_depth == 0).astype(np.uint8),
+                            inpaintRadius=3,
+                            flags=cv2.INPAINT_NS,
+                        )
+                    ).to(self.device)
+                else:
+                    mono_depth = torch.from_numpy(mono_depth).to(self.device)
 
-            est_frontend_depth[~valid_depth_mask] = mono_depth_wq[~valid_depth_mask]
+                valid_mask = (
+                        torch.from_numpy(eroded_image).to(self.device) * valid_depth_mask
+                )  # new
 
-        return est_frontend_depth, w2c, invalid
+                cur_wq = self.video.get_depth_scale_and_shift(
+                    video_idx, mono_depth, est_frontend_depth, valid_mask
+                )
+                mono_depth_wq = mono_depth * cur_wq[0] + cur_wq[1]
+
+                est_frontend_depth[~valid_depth_mask] = mono_depth_wq[~valid_depth_mask]
+
+            return est_frontend_depth, w2c, invalid
 
     def _add_to_window(
-        self, cur_frame_idx, cur_frame_visibility_filter, occ_aware_visibility, window
+            self, cur_frame_idx, cur_frame_visibility_filter, occ_aware_visibility, window
     ):
         """Refer to MonoGS"""
-        N_dont_touch = 2
-        window = [cur_frame_idx] + window
-        # remove frames which has little overlap with the current frame
-        curr_frame = self.cameras[cur_frame_idx]
-        to_remove = []
-        removed_frame = None
-        for i in range(N_dont_touch, len(window)):
-            kf_idx = window[i]
-            # szymkiewicz–simpson coefficient
-            intersection = torch.logical_and(
-                cur_frame_visibility_filter, occ_aware_visibility[kf_idx]
-            ).count_nonzero()
-            denom = min(
-                cur_frame_visibility_filter.count_nonzero(),
-                occ_aware_visibility[kf_idx].count_nonzero(),
-            )
-            point_ratio_2 = intersection / denom
-            cut_off = (
-                self.config["mapping"]["Training"]["kf_cutoff"]
-                if "kf_cutoff" in self.config["mapping"]["Training"]
-                else 0.4
-            )
-            if point_ratio_2 <= cut_off:
-                to_remove.append(kf_idx)
-
-        if to_remove:
-            window.remove(to_remove[-1])
-            removed_frame = to_remove[-1]
-        kf_0_WC = torch.linalg.inv(getWorld2View2(curr_frame.R, curr_frame.T))
-
-        if len(window) > self.window_size:
-            # we need to find the keyframe to remove...
-            inv_dist = []
+        with self._profile_timer(
+            "wildgs.mapper.add_to_window.total"
+        ):
+            N_dont_touch = 2
+            window = [cur_frame_idx] + window
+            # remove frames which has little overlap with the current frame
+            curr_frame = self.cameras[cur_frame_idx]
+            to_remove = []
+            removed_frame = None
             for i in range(N_dont_touch, len(window)):
-                inv_dists = []
-                kf_i_idx = window[i]
-                kf_i = self.cameras[kf_i_idx]
-                kf_i_CW = getWorld2View2(kf_i.R, kf_i.T)
-                for j in range(N_dont_touch, len(window)):
-                    if i == j:
-                        continue
-                    kf_j_idx = window[j]
-                    kf_j = self.cameras[kf_j_idx]
-                    kf_j_WC = torch.linalg.inv(getWorld2View2(kf_j.R, kf_j.T))
-                    T_CiCj = kf_i_CW @ kf_j_WC
-                    inv_dists.append(1.0 / (torch.norm(T_CiCj[0:3, 3]) + 1e-6).item())
-                T_CiC0 = kf_i_CW @ kf_0_WC
-                k = torch.sqrt(torch.norm(T_CiC0[0:3, 3])).item()
-                inv_dist.append(k * sum(inv_dists))
+                kf_idx = window[i]
+                # szymkiewicz–simpson coefficient
+                intersection = torch.logical_and(
+                    cur_frame_visibility_filter, occ_aware_visibility[kf_idx]
+                ).count_nonzero()
+                denom = min(
+                    cur_frame_visibility_filter.count_nonzero(),
+                    occ_aware_visibility[kf_idx].count_nonzero(),
+                )
+                point_ratio_2 = intersection / denom
+                cut_off = (
+                    self.config["mapping"]["Training"]["kf_cutoff"]
+                    if "kf_cutoff" in self.config["mapping"]["Training"]
+                    else 0.4
+                )
+                if point_ratio_2 <= cut_off:
+                    to_remove.append(kf_idx)
 
-            idx = np.argmax(inv_dist)
-            removed_frame = window[N_dont_touch + idx]
-            window.remove(removed_frame)
+            if to_remove:
+                window.remove(to_remove[-1])
+                removed_frame = to_remove[-1]
+            kf_0_WC = torch.linalg.inv(getWorld2View2(curr_frame.R, curr_frame.T))
 
-        return window, removed_frame
-    
+            if len(window) > self.window_size:
+                # we need to find the keyframe to remove...
+                inv_dist = []
+                for i in range(N_dont_touch, len(window)):
+                    inv_dists = []
+                    kf_i_idx = window[i]
+                    kf_i = self.cameras[kf_i_idx]
+                    kf_i_CW = getWorld2View2(kf_i.R, kf_i.T)
+                    for j in range(N_dont_touch, len(window)):
+                        if i == j:
+                            continue
+                        kf_j_idx = window[j]
+                        kf_j = self.cameras[kf_j_idx]
+                        kf_j_WC = torch.linalg.inv(getWorld2View2(kf_j.R, kf_j.T))
+                        T_CiCj = kf_i_CW @ kf_j_WC
+                        inv_dists.append(1.0 / (torch.norm(T_CiCj[0:3, 3]) + 1e-6).item())
+                    T_CiC0 = kf_i_CW @ kf_0_WC
+                    k = torch.sqrt(torch.norm(T_CiC0[0:3, 3])).item()
+                    inv_dist.append(k * sum(inv_dists))
+
+                idx = np.argmax(inv_dist)
+                removed_frame = window[N_dont_touch + idx]
+                window.remove(removed_frame)
+
+            return window, removed_frame
+
     def _send_to_gui(self, video_idx):
         """Send data to the GUI for visualization.
         """
-        viewpoint = self.cameras[video_idx]
-        keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
-        uncertainty_map = self.get_viewpoint_uncertainty_no_grad(viewpoint)
-        uncertainty_map = uncertainty_map.cpu().squeeze(0).numpy()
-        
-        current_window_dict = {}
-        current_window_dict[self.current_window[0]] = self.current_window[1:]
-        keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
-        self.q_main2vis.put(
-            gui_utils.GaussianPacket(
-                current_frame=viewpoint,
-                gaussians=self.gaussians,
-                gtcolor=viewpoint.original_image.squeeze(),
-                gtdepth=viewpoint.depth,
-                keyframes=keyframes,
-                kf_window=current_window_dict,
-                uncertainty=uncertainty_map,
-            )
-        )
+        with self._profile_timer(
+            "wildgs.mapper.gui.send.total"
+        ):
+            viewpoint = self.cameras[video_idx]
+            keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
+            uncertainty_map = self.get_viewpoint_uncertainty_no_grad(viewpoint)
+            uncertainty_map = uncertainty_map.cpu().squeeze(0).numpy()
 
+            current_window_dict = {}
+            current_window_dict[self.current_window[0]] = self.current_window[1:]
+            keyframes = [self.cameras[kf_idx] for kf_idx in self.current_window]
+            self.q_main2vis.put(
+                gui_utils.GaussianPacket(
+                    current_frame=viewpoint,
+                    gaussians=self.gaussians,
+                    gtcolor=viewpoint.original_image.squeeze(),
+                    gtdepth=viewpoint.depth,
+                    keyframes=keyframes,
+                    kf_window=current_window_dict,
+                    uncertainty=uncertainty_map,
+                )
+            )
 
     def initialize_mapper(self, cur_video_idx):
-        self.printer.print("Resetting the mapper", FontColor.MAPPER)
+        with self._profile_timer(
+            "wildgs.mapper.initialize.total"
+        ):
+            self.printer.print("Resetting the mapper", FontColor.MAPPER)
 
-        self.iteration_count = 0
-        self.iterations_after_densify_or_reset = 0
-        self.occ_aware_visibility = {}
-        self.frame_count_log = {}
-        self.current_window = []
-        self.keyframe_optimizers = None
+            self.iteration_count = 0
+            self.iterations_after_densify_or_reset = 0
+            self.occ_aware_visibility = {}
+            self.frame_count_log = {}
+            self.current_window = []
+            self.keyframe_optimizers = None
 
-        # Keys are video_idx and value is boolean.
-        # This is only useful in ablation study of no depth-regularization
-        self.is_kf = {}
+            # Keys are video_idx and value is boolean.
+            # This is only useful in ablation study of no depth-regularization.
+            self.is_kf = {}
 
-        # Create dictionary which stores the depth maps from the previous iteration
-        # This depth is used during map deformation if we have missing pixels
-        self.depth_dict = {}
+            # Depth maps from the previous iteration. These are used during
+            # map deformation when pixels are missing.
+            self.depth_dict = {}
 
-        # Dictionary of Camera objects at the frame index
-        # self.cameras contains all cameras.
-        self.cameras = {}
+            # Dictionary of Camera objects indexed by WildGS video index.
+            self.cameras = {}
 
-        # remove all gaussians
-        self.gaussians.prune_points(self.gaussians.unique_kfIDs >= 0)
-
-        opt_params = []
-
-        for video_idx in range(cur_video_idx + 1):
-            frame_idx = int(self.video.timestamp[video_idx])
-            self.frame_idxs.append(frame_idx)
-            self.video_idxs.append(video_idx)
-
-            viewpoint, invalid = self._get_viewpoint(video_idx, frame_idx)
-
-            if video_idx <= 11:
-                import hashlib
-                d = np.asarray(viewpoint.depth, dtype=np.float32)
-
-                print("\n========== VIEWPOINT DEPTH EXACT DEBUG ==========")
-                print("[VIEW DEPTH EXACT] video_idx:", video_idx)
-                print("[VIEW DEPTH EXACT] frame_idx:", frame_idx)
-                print("[VIEW DEPTH EXACT] shape:", d.shape)
-                print("[VIEW DEPTH EXACT] sum:", float(d.sum()))
-                print("[VIEW DEPTH EXACT] mean:", float(d.mean()))
-                print("[VIEW DEPTH EXACT] std:", float(d.std()))
-                print("[VIEW DEPTH EXACT] min:", float(d.min()))
-                print("[VIEW DEPTH EXACT] max:", float(d.max()))
-                print("[VIEW DEPTH EXACT] nonzero:", int(np.count_nonzero(d)))
-                print("[VIEW DEPTH EXACT] sample_0_0:", float(d[0, 0]))
-                print("[VIEW DEPTH EXACT] sample_100_100:", float(d[100, 100]))
-                print("[VIEW DEPTH EXACT] sample_180_320:", float(d[180, 320]))
-                print("[VIEW DEPTH EXACT] sample_250_500:", float(d[250, 500]))
-                print("[VIEW DEPTH EXACT] md5:", hashlib.md5(d.tobytes()).hexdigest())
-                print("================================================\n")
-
-
-            # Dictionary of Camera objects at the frame index
-            self.cameras[video_idx] = viewpoint
-
-            if invalid:
-                # Only happens when not using metric depth for tracking regularization
-                self.printer.print("WARNING: Too few valid pixels from droid depth", FontColor.MAPPER)
-                self.is_kf[video_idx] = False
-                continue  # too few valid pixels from droid depth
-
-            # update the dictionaries
-            self.depth_dict[video_idx] = torch.tensor(viewpoint.depth).to(self.device)
-            self.is_kf[video_idx] = True
-            self.frame_count_log[video_idx] = 0
-
-            print("[INIT PCD DEBUG] before extend | video_idx:", video_idx,
-                  "frame_idx:", frame_idx,
-                  "n_gauss:", self.gaussians.get_xyz.shape[0])
-
-            print("[INIT PCD DEBUG] depth shape:", viewpoint.depth.shape,
-                  "depth min:", np.min(viewpoint.depth),
-                  "depth max:", np.max(viewpoint.depth),
-                  "depth mean:", np.mean(viewpoint.depth),
-                  "valid depth:", np.sum(viewpoint.depth > 0))
-
-            self.gaussians.extend_from_pcd_seq(
-                viewpoint, kf_id=video_idx, init=True, depthmap=viewpoint.depth
-            )
-
-            print("[INIT PCD DEBUG] after extend | video_idx:", video_idx,
-                  "n_gauss:", self.gaussians.get_xyz.shape[0])
-
-            self.current_window.append(video_idx)
-
-            # Do not add first frame for exposure optimization
-            if video_idx != 0:
-                opt_params.append(
-                    {
-                        "params": [viewpoint.exposure_a],
-                        "lr": 0.01,
-                        "name": "exposure_a_{}".format(viewpoint.uid),
-                    }
+            with self._profile_timer(
+                "wildgs.mapper.initialize.prune_existing_gaussians"
+            ):
+                self.gaussians.prune_points(
+                    self.gaussians.unique_kfIDs >= 0
                 )
-                opt_params.append(
-                    {
-                        "params": [viewpoint.exposure_b],
-                        "lr": 0.01,
-                        "name": "exposure_b_{}".format(viewpoint.uid),
-                    }
-                )
-        self.keyframe_optimizers = torch.optim.Adam(opt_params)
 
-        with torch.no_grad():
-            xyz_before_init_opt = self.gaussians.get_xyz.detach()
+            opt_params = []
+            valid_initial_keyframes = 0
+            invalid_initial_keyframes = 0
 
-            print("\n========== ORIG INIT MAP OPT DEBUG BEFORE ==========")
-            print("[ORIG INIT OPT] cur_video_idx:", cur_video_idx)
-            print("[ORIG INIT OPT] current_window before:", self.current_window)
-            print("[ORIG INIT OPT] n_gauss before init opt:", int(xyz_before_init_opt.shape[0]))
-            print("[ORIG INIT OPT] xyz min before:",
-                  xyz_before_init_opt.min(dim=0).values.detach().cpu().numpy())
-            print("[ORIG INIT OPT] xyz max before:",
-                  xyz_before_init_opt.max(dim=0).values.detach().cpu().numpy())
-            print("====================================================\n")
+            for video_idx in range(cur_video_idx + 1):
+                frame_idx = int(self.video.timestamp[video_idx])
+                self.frame_idxs.append(frame_idx)
+                self.video_idxs.append(video_idx)
 
-        self.initialize_map_opt()
+                with self._profile_timer(
+                    "wildgs.mapper.initialize.get_viewpoint"
+                ):
+                    viewpoint, invalid = self._get_viewpoint(
+                        video_idx,
+                        frame_idx,
+                    )
 
-        with torch.no_grad():
-            xyz_after_init_opt = self.gaussians.get_xyz.detach()
+                if video_idx <= 11:
+                    import hashlib
+                    d = np.asarray(viewpoint.depth, dtype=np.float32)
 
-            print("\n========== ORIG INIT MAP OPT DEBUG AFTER ==========")
-            print("[ORIG INIT OPT] cur_video_idx:", cur_video_idx)
-            print("[ORIG INIT OPT] current_window after init opt:", self.current_window)
-            print("[ORIG INIT OPT] n_gauss after init opt:", int(xyz_after_init_opt.shape[0]))
-            print("[ORIG INIT OPT] xyz min after:",
-                  xyz_after_init_opt.min(dim=0).values.detach().cpu().numpy())
-            print("[ORIG INIT OPT] xyz max after:",
-                  xyz_after_init_opt.max(dim=0).values.detach().cpu().numpy())
-            print("===================================================\n")
+                    # print("\n========== VIEWPOINT DEPTH EXACT DEBUG ==========")
+                    # print("[VIEW DEPTH EXACT] video_idx:", video_idx)
+                    # print("[VIEW DEPTH EXACT] frame_idx:", frame_idx)
+                    # print("[VIEW DEPTH EXACT] shape:", d.shape)
+                    # print("[VIEW DEPTH EXACT] sum:", float(d.sum()))
+                    # print("[VIEW DEPTH EXACT] mean:", float(d.mean()))
+                    # print("[VIEW DEPTH EXACT] std:", float(d.std()))
+                    # print("[VIEW DEPTH EXACT] min:", float(d.min()))
+                    # print("[VIEW DEPTH EXACT] max:", float(d.max()))
+                    # print("[VIEW DEPTH EXACT] nonzero:", int(np.count_nonzero(d)))
+                    # print("[VIEW DEPTH EXACT] sample_0_0:", float(d[0, 0]))
+                    # print("[VIEW DEPTH EXACT] sample_100_100:", float(d[100, 100]))
+                    # print("[VIEW DEPTH EXACT] sample_180_320:", float(d[180, 320]))
+                    # print("[VIEW DEPTH EXACT] sample_250_500:", float(d[250, 500]))
+                    # print("[VIEW DEPTH EXACT] md5:", hashlib.md5(d.tobytes()).hexdigest())
+                    # print("================================================\n")
 
-        # Only keep the recent <self.window_size> number of keyframes in the window
-        self.current_window = self.current_window[-self.window_size:]
+                # Dictionary of Camera objects at the video index.
+                self.cameras[video_idx] = viewpoint
 
-        print("[ORIG INIT OPT] current_window after trim:", self.current_window)
+                if invalid:
+                    # Only happens when not using metric depth for
+                    # tracking regularization.
+                    self.printer.print(
+                        "WARNING: Too few valid pixels from droid depth",
+                        FontColor.MAPPER,
+                    )
+                    self.is_kf[video_idx] = False
+                    invalid_initial_keyframes += 1
+                    continue
 
-        if self.config['gui']:
-            self._send_to_gui(cur_video_idx)
+                valid_initial_keyframes += 1
+
+                self.depth_dict[video_idx] = torch.tensor(
+                    viewpoint.depth
+                ).to(self.device)
+                self.is_kf[video_idx] = True
+                self.frame_count_log[video_idx] = 0
+
+                with self._profile_timer(
+                    "wildgs.mapper.initialize.gaussian_insert"
+                ):
+                    self.gaussians.extend_from_pcd_seq(
+                        viewpoint,
+                        kf_id=video_idx,
+                        init=True,
+                        depthmap=viewpoint.depth,
+                    )
+
+                self.current_window.append(video_idx)
+
+                # Do not add the first frame for exposure optimization.
+                if video_idx != 0:
+                    opt_params.append(
+                        {
+                            "params": [viewpoint.exposure_a],
+                            "lr": 0.01,
+                            "name": "exposure_a_{}".format(viewpoint.uid),
+                        }
+                    )
+                    opt_params.append(
+                        {
+                            "params": [viewpoint.exposure_b],
+                            "lr": 0.01,
+                            "name": "exposure_b_{}".format(viewpoint.uid),
+                        }
+                    )
+
+            with self._profile_timer(
+                "wildgs.mapper.initialize.create_keyframe_optimizer"
+            ):
+                self.keyframe_optimizers = torch.optim.Adam(opt_params)
+
+            with self._profile_timer(
+                "wildgs.mapper.initialize.map_optimization"
+            ):
+                self.initialize_map_opt()
+
+            # Only keep the most recent <self.window_size> keyframes.
+            self.current_window = self.current_window[-self.window_size:]
+
+
+            if self.config["gui"]:
+                self._send_to_gui(cur_video_idx)
 
     def refine_pose_non_key_frame(
-        self, frame_idx: int, w2c_init: torch.Tensor, features: torch.Tensor = None
+            self, frame_idx: int, w2c_init: torch.Tensor, features: torch.Tensor = None
     ) -> torch.Tensor:
         """
         Optimize the pose for a non-key frame.
@@ -968,330 +988,733 @@ class Mapper(object):
         """
         # We always use the downsampled image for tracking.
         # Full resolution only for the mapping even if it's activated.
-        color = self.frame_reader.get_color(frame_idx).to(self.device).squeeze()
+        with self._profile_timer(
+            "wildgs.mapper.pose_refinement.total"
+        ):
+            color = self.frame_reader.get_color(frame_idx).to(self.device).squeeze()
 
-        data = {
-            "idx": frame_idx,
-            "gt_color": color.squeeze(),
-            "est_depth": None,
-            "est_pose": w2c_init,
-            "features": features,
-        }
+            data = {
+                "idx": frame_idx,
+                "gt_color": color.squeeze(),
+                "est_depth": None,
+                "est_pose": w2c_init,
+                "features": features,
+            }
 
-        # Using uncertainty only when uncertainty-aware tracking is activated
-        if self.video.uncertainty_aware:
-            with torch.no_grad():
-                uncer = self.uncer_network(features.to(color.device))
-                uncer = torch.clip(uncer, min=0.1) + 1e-3
-                uncer_resized = F.interpolate(
-                    uncer.unsqueeze(0).unsqueeze(0),
-                    size=color.shape[-2:],
-                    mode="bilinear",
-                ).squeeze()
-                data_rate = 1 + 1 * map_utils.compute_bias_factor(
-                    self.config["mapping"]["uncertainty_params"]["train_frac_fix"], 0.8
+            # Using uncertainty only when uncertainty-aware tracking is activated
+            if self.video.uncertainty_aware:
+                with torch.no_grad():
+                    uncer = self.uncer_network(features.to(color.device))
+                    uncer = torch.clip(uncer, min=0.1) + 1e-3
+                    uncer_resized = F.interpolate(
+                        uncer.unsqueeze(0).unsqueeze(0),
+                        size=color.shape[-2:],
+                        mode="bilinear",
+                    ).squeeze()
+                    data_rate = 1 + 1 * map_utils.compute_bias_factor(
+                        self.config["mapping"]["uncertainty_params"]["train_frac_fix"], 0.8
+                    )
+                    uncer_resized = (uncer_resized - 0.1) * data_rate + 0.1
+            else:
+                uncer_resized = None
+
+            viewpoint = Camera.init_from_dataset(
+                self.frame_reader,
+                data,
+                self.projection_matrix,
+            )
+            viewpoint.compute_grad_mask(self.config)
+            viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
+
+            opt_params = [
+                {
+                    "params": [viewpoint.cam_rot_delta],
+                    "lr": self.config["mapping"]["Training"]["lr"]["cam_rot_delta"],
+                    "name": f"rot_{viewpoint.uid}",
+                },
+                {
+                    "params": [viewpoint.cam_trans_delta],
+                    "lr": self.config["mapping"]["Training"]["lr"]["cam_trans_delta"],
+                    "name": f"trans_{viewpoint.uid}",
+                },
+                {
+                    "params": [viewpoint.exposure_a],
+                    "lr": 0.01,
+                    "name": f"exposure_a_{viewpoint.uid}",
+                },
+                {
+                    "params": [viewpoint.exposure_b],
+                    "lr": 0.01,
+                    "name": f"exposure_b_{viewpoint.uid}",
+                },
+            ]
+
+            pose_optimizer = torch.optim.Adam(opt_params)
+            tracking_itr_num = 100  # This number is taken from monoGS
+            for _ in range(tracking_itr_num):
+                with self._profile_timer(
+                    "wildgs.mapper.pose_refinement.render"
+                ):
+                    render_pkg = render(
+                        viewpoint, self.gaussians, self.pipeline_params, self.background
+                    )
+                image, depth, opacity = (
+                    render_pkg["render"],
+                    render_pkg["depth"],
+                    render_pkg["opacity"],
                 )
-                uncer_resized = (uncer_resized - 0.1) * data_rate + 0.1
-        else:
-            uncer_resized = None
+                pose_optimizer.zero_grad()
+                with self._profile_timer(
+                    "wildgs.mapper.pose_refinement.calculate_loss"
+                ):
+                    loss_tracking = get_loss_tracking(
+                        self.config["mapping"],
+                        image,
+                        depth,
+                        opacity,
+                        viewpoint,
+                        uncertainty=uncer_resized,
+                    )
 
-        viewpoint = Camera.init_from_dataset(
-            self.frame_reader,
-            data,
-            self.projection_matrix,
-        )
-        viewpoint.compute_grad_mask(self.config)
-        viewpoint.update_RT(viewpoint.R_gt, viewpoint.T_gt)
+                with self._profile_timer(
+                    "wildgs.mapper.pose_refinement.backward"
+                ):
+                    loss_tracking.backward()
 
-        opt_params = [
-            {
-                "params": [viewpoint.cam_rot_delta],
-                "lr": self.config["mapping"]["Training"]["lr"]["cam_rot_delta"],
-                "name": f"rot_{viewpoint.uid}",
-            },
-            {
-                "params": [viewpoint.cam_trans_delta],
-                "lr": self.config["mapping"]["Training"]["lr"]["cam_trans_delta"],
-                "name": f"trans_{viewpoint.uid}",
-            },
-            {
-                "params": [viewpoint.exposure_a],
-                "lr": 0.01,
-                "name": f"exposure_a_{viewpoint.uid}",
-            },
-            {
-                "params": [viewpoint.exposure_b],
-                "lr": 0.01,
-                "name": f"exposure_b_{viewpoint.uid}",
-            },
-        ]
+                with self._profile_timer(
+                    "wildgs.mapper.pose_refinement.optimizer_step"
+                ):
+                    with torch.no_grad():
+                        pose_optimizer.step()
+                        converged = update_pose(viewpoint)
 
-        pose_optimizer = torch.optim.Adam(opt_params)
-        tracking_itr_num = 100  # This number is taken from monoGS
-        for _ in range(tracking_itr_num):
-            render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
-            )
-            image, depth, opacity = (
-                render_pkg["render"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
-            )
-            pose_optimizer.zero_grad()
-            loss_tracking = get_loss_tracking(
-                self.config["mapping"],
-                image,
-                depth,
-                opacity,
-                viewpoint,
-                uncertainty=uncer_resized,
-            )
-            loss_tracking.backward()
+                if converged:
+                    break
 
-            with torch.no_grad():
-                pose_optimizer.step()
-                converged = update_pose(viewpoint)
+            w2c_refined = torch.eye(4, device=viewpoint.R.device)
+            w2c_refined[:3, :3] = viewpoint.R
+            w2c_refined[:3, 3] = viewpoint.T
 
-            if converged:
-                break
-
-        w2c_refined = torch.eye(4, device=viewpoint.R.device)
-        w2c_refined[:3, :3] = viewpoint.R
-        w2c_refined[:3, 3] = viewpoint.T
-
-        return w2c_refined
+            return w2c_refined
 
     """
     Map Optimization functions (init, online, final_refine)
     """
+
     def initialize_map_opt(self):
-        viewpoint_stack = []
-        viewpoint_id_stack = []
-        for kf_idx in self.current_window:
-            viewpoint = self.cameras[kf_idx]
-            viewpoint_stack.append(viewpoint)
-            viewpoint_id_stack.append(kf_idx)
+        with self._profile_timer(
+            "wildgs.mapper.initialize_map_opt.total"
+        ):
+            viewpoint_stack = []
+            viewpoint_id_stack = []
 
-        for mapping_iteration in range(self.init_itr_num):
-            self.iteration_count += 1
-            self.iterations_after_densify_or_reset += 1
-            # randomly select a viewpoint from the first K keyframes
-            cam_idx = np.random.choice(range(len(viewpoint_stack)))
-            viewpoint = viewpoint_stack[cam_idx]
-            kf_idx = viewpoint_id_stack[cam_idx]
+            for kf_idx in self.current_window:
+                viewpoint = self.cameras[kf_idx]
+                viewpoint_stack.append(viewpoint)
+                viewpoint_id_stack.append(kf_idx)
 
-            render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
-            )
-            (
-                image,
-                viewspace_point_tensor,
-                visibility_filter,
-                radii,
-                depth,
-                opacity,
-                n_touched,
-            ) = (
-                render_pkg["render"],
-                render_pkg["viewspace_points"],
-                render_pkg["visibility_filter"],
-                render_pkg["radii"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
-                render_pkg["n_touched"],
-            )
-            if not self.uncertainty_aware:
-                loss_init = get_loss_mapping(
-                    self.config["mapping"],
+
+            for mapping_iteration in range(self.init_itr_num):
+                self.iteration_count += 1
+                self.iterations_after_densify_or_reset += 1
+
+                # Randomly select a viewpoint from the initial keyframes.
+                cam_idx = np.random.choice(range(len(viewpoint_stack)))
+                viewpoint = viewpoint_stack[cam_idx]
+                kf_idx = viewpoint_id_stack[cam_idx]
+
+                with self._profile_timer(
+                    "wildgs.mapper.initialize_map_opt.render"
+                ):
+                    render_pkg = render(
+                        viewpoint,
+                        self.gaussians,
+                        self.pipeline_params,
+                        self.background,
+                    )
+                (
                     image,
+                    viewspace_point_tensor,
+                    visibility_filter,
+                    radii,
                     depth,
-                    viewpoint,
-
-                    initialization=True,
+                    opacity,
+                    n_touched,
+                ) = (
+                    render_pkg["render"],
+                    render_pkg["viewspace_points"],
+                    render_pkg["visibility_filter"],
+                    render_pkg["radii"],
+                    render_pkg["depth"],
+                    render_pkg["opacity"],
+                    render_pkg["n_touched"],
                 )
-            else:
-                train_frac = self.uncer_params["train_frac_fix"]
-                ssim_frac = self.uncer_params["train_frac_fix"]
+
+                if not self.uncertainty_aware:
+                    loss_init = get_loss_mapping(
+                        self.config["mapping"],
+                        image,
+                        depth,
+                        viewpoint,
+                        initialization=True,
+                    )
+                else:
+
+                    train_frac = self.uncer_params["train_frac_fix"]
+                    ssim_frac = self.uncer_params["train_frac_fix"]
+
+                    if self.config["mapping"]["full_resolution"]:
+                        depth = F.interpolate(
+                            depth.unsqueeze(0),
+                            viewpoint.depth.shape,
+                            mode="bicubic",
+                        ).squeeze(0)
+
+                    current_uncertainty, loss_init = (
+                        get_loss_mapping_uncertainty(
+                            self.config["mapping"],
+                            image,
+                            depth,
+                            viewpoint,
+                            opacity,
+                            self.uncer_network,
+                            train_frac,
+                            ssim_frac,
+                            initialization=True,
+                        )
+                    )
+
+                    stride = self.config["mapping"][
+                        "uncertainty_params"
+                    ]["reg_stride"]
+                    feature_buffer = [
+                        viewpoint.features[::stride, ::stride].to(
+                            device=image.device
+                        ),
+                    ]
+                    uncer_buffer = [
+                        current_uncertainty[
+                            ::stride,
+                            ::stride,
+                        ].unsqueeze(-1),
+                    ]
+
+                    loss_init += self.config["mapping"][
+                                     "uncertainty_params"
+                                 ]["reg_mult"] * (
+                                     map_utils.compute_dino_regularization_loss(
+                                         uncer_buffer,
+                                         feature_buffer,
+                                     )
+                                 )
+
+
+                scaling = self.gaussians.get_scaling
+                isotropic_loss = torch.abs(
+                    scaling
+                    - scaling.mean(dim=1).view(-1, 1)
+                )
+                loss_init += 10 * isotropic_loss.mean()
+
+                with self._profile_timer(
+                    "wildgs.mapper.initialize_map_opt.backward"
+                ):
+                    loss_init.backward()
+
+                with torch.no_grad():
+                    self.gaussians.max_radii2D[
+                        visibility_filter
+                    ] = torch.max(
+                        self.gaussians.max_radii2D[
+                            visibility_filter
+                        ],
+                        radii[visibility_filter],
+                    )
+                    self.gaussians.add_densification_stats(
+                        viewspace_point_tensor,
+                        visibility_filter,
+                    )
+
+                    if mapping_iteration % self.init_gaussian_update == 0:
+                        with self._profile_timer(
+                            "wildgs.mapper.initialize_map_opt.densify_and_prune"
+                        ):
+                            self.gaussians.densify_and_prune(
+                                self.opt_params.densify_grad_threshold,
+                                self.init_gaussian_th,
+                                self.init_gaussian_extent,
+                                None,
+                            )
+                        self.iterations_after_densify_or_reset = 0
+
+                    if self.iteration_count == self.init_gaussian_reset:
+                        with self._profile_timer(
+                            "wildgs.mapper.initialize_map_opt.reset_opacity"
+                        ):
+                            self.gaussians.reset_opacity()
+                        self.iterations_after_densify_or_reset = 0
+
+                    with self._profile_timer(
+                        "wildgs.mapper.initialize_map_opt.optimizer_steps"
+                    ):
+                        self.gaussians.optimizer.step()
+                        self.gaussians.optimizer.zero_grad(
+                            set_to_none=True
+                        )
+                        self.gaussians.update_learning_rate(
+                            self.iteration_count
+                        )
+                        self.keyframe_optimizers.step()
+                        self.keyframe_optimizers.zero_grad(
+                            set_to_none=True
+                        )
+
+                        if self.uncertainty_aware:
+                            self.uncer_optimizer.step()
+                            self.uncer_optimizer.zero_grad()
+
+                    self.frame_count_log[kf_idx] += 1
+
+                self.occ_aware_visibility[kf_idx] = (
+                        n_touched > 0
+                ).long()
+
+
+            self.printer.print("Initialized map", FontColor.MAPPER)
+
+            if self.online_plotting:
+                plot_dir = self.save_dir + "/online_plots"
+                suffix = "_init"
+
+                for cur_idx in self.current_window:
+                    self.save_fig_everything(
+                        cur_idx,
+                        plot_dir,
+                        suffix,
+                    )
+
+
+            return render_pkg
+
+    def map_opt_online(self, current_window, iters=1):
+        with self._profile_timer(
+            "wildgs.mapper.map_opt_online.total"
+        ):
+            if len(current_window) == 0:
+                raise ValueError("No keyframes in the current window")
+
+            cur_idx = current_window[
+                np.array(current_window).argmax()
+            ]
+
+            if self.online_plotting:
+                plot_dir = self.save_dir + "/online_plots"
+                suffix = "_before_opt"
+                self.save_fig_everything(
+                    cur_idx,
+                    plot_dir,
+                    suffix,
+                )
+
+            viewpoint_stack = []
+            viewpoint_kf_idx_stack = []
+
+            for kf_idx, viewpoint in self.cameras.items():
+                if self.is_kf[kf_idx]:
+                    viewpoint_stack.append(viewpoint)
+                    viewpoint_kf_idx_stack.append(kf_idx)
+
+            # The current frame receives at least 50% probability and
+            # the remaining probability is distributed across the rest.
+            cur_window_prob = 0.5
+            prob = np.full(
+                len(viewpoint_stack),
+                (1 - cur_window_prob)
+                * iters
+                / (
+                        len(viewpoint_stack)
+                        - len(current_window)
+                ),
+            )
+
+            assert viewpoint_kf_idx_stack[-1] == cur_idx
+
+            if (
+                    len(current_window)
+                    <= len(viewpoint_stack) / 2.0
+            ):
+                for view_idx in range(
+                        len(viewpoint_kf_idx_stack)
+                ):
+                    kf_idx = viewpoint_kf_idx_stack[
+                        view_idx
+                    ]
+
+                    if kf_idx in current_window:
+                        prob[view_idx] = (
+                                cur_window_prob
+                                * iters
+                                / len(current_window)
+                        )
+
+            prob /= prob.sum()
+
+
+            for cur_iter in range(iters):
+                self.iteration_count += 1
+                self.iterations_after_densify_or_reset += 1
+
+                loss_mapping = 0
+
+                cam_idx = np.random.choice(
+                    np.arange(len(viewpoint_stack)),
+                    p=prob,
+                )
+                viewpoint = viewpoint_stack[cam_idx]
+
+                with self._profile_timer(
+                    "wildgs.mapper.map_opt_online.render"
+                ):
+                    render_pkg = render(
+                        viewpoint,
+                        self.gaussians,
+                        self.pipeline_params,
+                        self.background,
+                    )
+                (
+                    image,
+                    viewspace_point_tensor,
+                    visibility_filter,
+                    radii,
+                    depth,
+                    opacity,
+                    n_touched,
+                ) = (
+                    render_pkg["render"],
+                    render_pkg["viewspace_points"],
+                    render_pkg["visibility_filter"],
+                    render_pkg["radii"],
+                    render_pkg["depth"],
+                    render_pkg["opacity"],
+                    render_pkg["n_touched"],
+                )
+
+                if self.config["mapping"]["full_resolution"]:
+                    depth = F.interpolate(
+                        depth.unsqueeze(0),
+                        viewpoint.depth.shape,
+                        mode="bicubic",
+                    ).squeeze(0)
+
+                if not self.uncertainty_aware:
+                    loss_mapping += get_loss_mapping(
+                        self.config["mapping"],
+                        image,
+                        depth,
+                        viewpoint,
+                    )
+                else:
+
+                    train_frac = self.uncer_params[
+                        "train_frac_fix"
+                    ]
+                    ssim_frac = self.uncer_params[
+                        "train_frac_fix"
+                    ]
+
+                    (
+                        current_uncertainty,
+                        current_loss_mapping,
+                    ) = get_loss_mapping_uncertainty(
+                        self.config["mapping"],
+                        (
+                                torch.exp(viewpoint.exposure_a)
+                                * image
+                                + viewpoint.exposure_b
+                        ),
+                        depth,
+                        viewpoint,
+                        opacity,
+                        self.uncer_network,
+                        train_frac,
+                        ssim_frac,
+                        freeze_uncertainty_loss=(
+                                self.iterations_after_densify_or_reset
+                                < 20
+                        ),
+                    )
+                    loss_mapping += current_loss_mapping
+
+                    if (
+                            self.iterations_after_densify_or_reset
+                            >= 20
+                    ):
+                        stride = self.config["mapping"][
+                            "uncertainty_params"
+                        ]["reg_stride"]
+                        reg_multi = self.config["mapping"][
+                            "uncertainty_params"
+                        ]["reg_mult"]
+
+                        viewpoint = viewpoint_stack[cam_idx]
+                        feature_buffer = [
+                            viewpoint_stack[
+                                reg_cam_idx
+                            ].features.to(
+                                device=image.device
+                            )
+                            for reg_cam_idx in range(
+                                max(0, cam_idx - 2),
+                                min(
+                                    len(viewpoint_stack),
+                                    cam_idx + 3,
+                                ),
+                            )
+                        ]
+                        feat_dim = feature_buffer[0].shape[-1]
+                        feature_buffer = torch.stack(
+                            feature_buffer
+                        ).view(-1, feat_dim)
+                        num_samples = (
+                                feature_buffer.shape[0]
+                                // (stride ** 4)
+                        )
+                        sampled_feature = feature_buffer[
+                            torch.randperm(
+                                feature_buffer.shape[0]
+                            )[:num_samples]
+                        ].unsqueeze(0)
+                        sampled_uncer = self.uncer_network(
+                            sampled_feature
+                        )
+                        loss_mapping += (
+                                reg_multi
+                                * map_utils.compute_dino_regularization_loss(
+                            sampled_uncer,
+                            sampled_feature,
+                        )
+                        )
+
+
+                scaling = self.gaussians.get_scaling
+                isotropic_loss = torch.abs(
+                    scaling
+                    - scaling.mean(dim=1).view(-1, 1)
+                )
+                loss_mapping += 10 * isotropic_loss.mean()
+
+                with self._profile_timer(
+                    "wildgs.mapper.map_opt_online.backward"
+                ):
+                    loss_mapping.backward()
+
+                gaussian_split = False
+
+                with torch.no_grad():
+                    if cur_iter == iters - 1:
+                        with self._profile_timer(
+                            "wildgs.mapper.map_opt_online.visibility_update"
+                        ):
+                            self._update_occ_aware_visibility(
+                                current_window
+                            )
+
+                    self.gaussians.max_radii2D[
+                        visibility_filter
+                    ] = torch.max(
+                        self.gaussians.max_radii2D[
+                            visibility_filter
+                        ],
+                        radii[visibility_filter],
+                    )
+                    self.gaussians.add_densification_stats(
+                        viewspace_point_tensor,
+                        visibility_filter,
+                    )
+
+                    update_gaussian = (
+                            self.iteration_count
+                            % self.gaussian_update_every
+                            == self.gaussian_update_offset
+                    )
+
+                    if update_gaussian:
+                        with self._profile_timer(
+                            "wildgs.mapper.map_opt_online.densify_and_prune"
+                        ):
+                            self.gaussians.densify_and_prune(
+                                self.opt_params.densify_grad_threshold,
+                                self.gaussian_th,
+                                self.gaussian_extent,
+                                self.size_threshold,
+                            )
+
+                        gaussian_split = True
+                        self.iterations_after_densify_or_reset = 0
+                        self.printer.print(
+                            "Densify and prune the Gaussians",
+                            FontColor.MAPPER,
+                        )
+
+                    if (
+                            self.iteration_count
+                            % self.gaussian_reset
+                    ) == 0 and not update_gaussian:
+                        self.printer.print(
+                            "Resetting the opacity of non-visible Gaussians",
+                            FontColor.MAPPER,
+                        )
+
+                        with self._profile_timer(
+                            "wildgs.mapper.map_opt_online.reset_opacity_nonvisible"
+                        ):
+                            self.gaussians.reset_opacity_nonvisible(
+                                [visibility_filter]
+                            )
+
+                        gaussian_split = True
+                        self.iterations_after_densify_or_reset = 0
+
+                    with self._profile_timer(
+                        "wildgs.mapper.map_opt_online.optimizer_steps"
+                    ):
+                        self.gaussians.optimizer.step()
+                        self.gaussians.optimizer.zero_grad(
+                            set_to_none=True
+                        )
+                        self.gaussians.update_learning_rate(
+                            self.iteration_count
+                        )
+                        self.keyframe_optimizers.step()
+                        self.keyframe_optimizers.zero_grad(
+                            set_to_none=True
+                        )
+
+                        if self.uncertainty_aware:
+                            self.uncer_optimizer.step()
+                            self.uncer_optimizer.zero_grad()
+
+                self.frame_count_log[
+                    viewpoint_kf_idx_stack[cam_idx]
+                ] += 1
+
+
+            if self.online_plotting:
+                plot_dir = self.save_dir + "/online_plots"
+                suffix = "_after_opt"
+                self.save_fig_everything(
+                    cur_idx,
+                    plot_dir,
+                    suffix,
+                )
+
+            if self.vis_uncertainty_online:
+                self._vis_uncertainty_mask_all()
+
+
+            return gaussian_split
+
+    def final_refine(self, iters=26000):
+        with self._profile_timer(
+            "wildgs.mapper.final_refine.total"
+        ):
+            self.printer.print("Starting final refinement", FontColor.MAPPER)
+
+            # Do final update of depths and poses
+            self._update_keyframes_from_frontend()
+
+            random_viewpoint_stack, random_viewpoint_kf_idx_stack = [], []
+            for kf_idx, viewpoint in self.cameras.items():
+                if self.is_kf[kf_idx]:
+                    random_viewpoint_stack.append(viewpoint)
+                    random_viewpoint_kf_idx_stack.append(kf_idx)
+
+            for _ in tqdm(range(iters)):
+                self.iteration_count += 1
+                self.iterations_after_densify_or_reset += 1
+
+                loss_mapping = 0
+                viewspace_point_tensor_acm = []
+                visibility_filter_acm = []
+                radii_acm = []
+                n_touched_acm = []
+
+                uncer_buffer, feature_buffer = [], []
+
+                rand_idx = np.random.choice(range(len(random_viewpoint_stack)))
+                random_viewpoint_kf_idxs = []
+
+                viewpoint = random_viewpoint_stack[rand_idx]
+                random_viewpoint_kf_idxs.append(random_viewpoint_kf_idx_stack[rand_idx])
+                with self._profile_timer(
+                    "wildgs.mapper.final_refine.render"
+                ):
+                    render_pkg = render(
+                        viewpoint, self.gaussians, self.pipeline_params, self.background
+                    )
+                (
+                    image,
+                    viewspace_point_tensor,
+                    visibility_filter,
+                    radii,
+                    depth,
+                    opacity,
+                    n_touched,
+                ) = (
+                    render_pkg["render"],
+                    render_pkg["viewspace_points"],
+                    render_pkg["visibility_filter"],
+                    render_pkg["radii"],
+                    render_pkg["depth"],
+                    render_pkg["opacity"],
+                    render_pkg["n_touched"],
+                )
                 if self.config["mapping"]["full_resolution"]:
                     depth = F.interpolate(
                         depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
                     ).squeeze(0)
-                current_uncertainty, loss_init = get_loss_mapping_uncertainty(
-                    self.config["mapping"],
-                    image,
-                    depth,
-                    viewpoint,
-                    opacity,
-                    self.uncer_network,
-                    train_frac,
-                    ssim_frac,
-                    initialization=True,
-                )
-
-                stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
-                feature_buffer = [
-                    viewpoint.features[::stride, ::stride].to(device=image.device),
-                ]
-                uncer_buffer = [
-                    current_uncertainty[::stride, ::stride].unsqueeze(-1),
-                ]
-                loss_init += self.config["mapping"]["uncertainty_params"][
-                    "reg_mult"
-                ] * map_utils.compute_dino_regularization_loss(
-                    uncer_buffer, feature_buffer
-                )
-
-            scaling = self.gaussians.get_scaling
-            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
-            loss_init += 10 * isotropic_loss.mean()
-
-            loss_init.backward()
-
-            with torch.no_grad():
-                self.gaussians.max_radii2D[visibility_filter] = torch.max(
-                    self.gaussians.max_radii2D[visibility_filter],
-                    radii[visibility_filter],
-                )
-                self.gaussians.add_densification_stats(
-                    viewspace_point_tensor, visibility_filter
-                )
-                if mapping_iteration % self.init_gaussian_update == 0:
-                    self.gaussians.densify_and_prune(
-                        self.opt_params.densify_grad_threshold,
-                        self.init_gaussian_th,
-                        self.init_gaussian_extent,
-                        None,
+                if not self.uncertainty_aware:
+                    loss_mapping += get_loss_mapping(
+                        self.config["mapping"], image, depth, viewpoint
                     )
-                    self.iterations_after_densify_or_reset = 0
+                else:
+                    train_frac = self.uncer_params["train_frac_fix"]
+                    ssim_frac = self.uncer_params["train_frac_fix"]
 
-                if self.iteration_count == self.init_gaussian_reset:
-                    self.gaussians.reset_opacity()
-                    self.iterations_after_densify_or_reset = 0
+                    (
+                        current_uncertainty,
+                        loss_mapping_this_frame,
+                    ) = get_loss_mapping_uncertainty(
+                        self.config["mapping"],
+                        image,
+                        depth,
+                        viewpoint,
+                        opacity,
+                        self.uncer_network,
+                        train_frac,
+                        ssim_frac,
+                        freeze_uncertainty_loss=self.iterations_after_densify_or_reset
+                                                < 200,
+                    )
+                    loss_mapping += loss_mapping_this_frame
 
-                self.gaussians.optimizer.step()
-                self.gaussians.optimizer.zero_grad(set_to_none=True)
-                self.gaussians.update_learning_rate(self.iteration_count)
-                self.keyframe_optimizers.step()
-                self.keyframe_optimizers.zero_grad(set_to_none=True)
-                if self.uncertainty_aware:
-                    self.uncer_optimizer.step()
-                    self.uncer_optimizer.zero_grad()
+                    stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
+                    uncer_buffer.append(
+                        current_uncertainty[::stride, ::stride].unsqueeze(-1)
+                    )
+                    feature_buffer.append(
+                        viewpoint.features[::stride, ::stride].to(device=image.device)
+                    )
 
-                self.frame_count_log[kf_idx] += 1
-
-            self.occ_aware_visibility[kf_idx] = (n_touched > 0).long()
-        self.printer.print("Initialized map", FontColor.MAPPER)
-
-        # online plotting
-        if self.online_plotting:
-            plot_dir = self.save_dir + "/online_plots"
-            suffix = "_init"
-            for cur_idx in self.current_window:
-                self.save_fig_everything(cur_idx, plot_dir, suffix)
-
-        return render_pkg
-
-    def map_opt_online(self, current_window, iters=1):
-        if len(current_window) == 0:
-            raise ValueError("No keyframes in the current window")
-
-        # Online plot before optimization
-        cur_idx = current_window[np.array(current_window).argmax()]
-        if self.online_plotting:
-            plot_dir = self.save_dir + "/online_plots"
-            suffix = "_before_opt"
-            self.save_fig_everything(cur_idx, plot_dir, suffix)
-
-        viewpoint_stack, viewpoint_kf_idx_stack = [], []
-        for kf_idx, viewpoint in self.cameras.items():
-            if self.is_kf[kf_idx]:
-                viewpoint_stack.append(viewpoint)
-                viewpoint_kf_idx_stack.append(kf_idx)
-
-        # We set the current frame to be chosen by prob at least 50%
-        # and the rest frame evenly distribute the remaining prob
-        cur_window_prob = 0.5
-        prob = np.full(
-            len(viewpoint_stack),
-            (1 - cur_window_prob)
-            * iters
-            / (len(viewpoint_stack) - len(current_window)),
-        )
-        assert viewpoint_kf_idx_stack[-1] == cur_idx
-        if len(current_window) <= len(viewpoint_stack) / 2.0:
-            for view_idx in range(len(viewpoint_kf_idx_stack)):
-                kf_idx = viewpoint_kf_idx_stack[view_idx]
-                if kf_idx in current_window:
-                    prob[view_idx] = cur_window_prob * iters / (len(current_window))
-        prob /= prob.sum()
-
-        for cur_iter in range(iters):
-            self.iteration_count += 1
-            self.iterations_after_densify_or_reset += 1
-
-            loss_mapping = 0
-
-            cam_idx = np.random.choice(np.arange(len(viewpoint_stack)), p=prob)
-            viewpoint = viewpoint_stack[cam_idx]
-            render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
-            )
-            (
-                image,
-                viewspace_point_tensor,
-                visibility_filter,
-                radii,
-                depth,
-                opacity,
-                n_touched,
-            ) = (
-                render_pkg["render"],
-                render_pkg["viewspace_points"],
-                render_pkg["visibility_filter"],
-                render_pkg["radii"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
-                render_pkg["n_touched"],
-            )
-
-            if self.config["mapping"]["full_resolution"]:
-                depth = F.interpolate(
-                    depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
-                ).squeeze(0)
-            if not self.uncertainty_aware:
-                loss_mapping += get_loss_mapping(
-                    self.config["mapping"], image, depth, viewpoint
-                )
-            else:
-                train_frac = self.uncer_params["train_frac_fix"]
-                ssim_frac = self.uncer_params["train_frac_fix"]
-
-                (
-                    current_uncertainty,
-                    current_loss_mapping,
-                ) = get_loss_mapping_uncertainty(
-                    self.config["mapping"],
-                    (torch.exp(viewpoint.exposure_a)) * image + viewpoint.exposure_b,
-                    depth,
-                    viewpoint,
-                    opacity,
-                    self.uncer_network,
-                    train_frac,
-                    ssim_frac,
-                    freeze_uncertainty_loss=self.iterations_after_densify_or_reset < 20,
-                )
-                loss_mapping += current_loss_mapping
-
-                # Dino_regularization loss
-                if self.iterations_after_densify_or_reset >= 20:
+                if self.uncertainty_aware and self.iterations_after_densify_or_reset >= 200:
                     stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
                     reg_multi = self.config["mapping"]["uncertainty_params"]["reg_mult"]
-
-                    viewpoint = viewpoint_stack[cam_idx]
+                    viewpoint = random_viewpoint_stack[rand_idx]
                     feature_buffer = [
-                        viewpoint_stack[reg_cam_idx].features.to(device=image.device)
+                        random_viewpoint_stack[reg_cam_idx].features.to(device=image.device)
                         for reg_cam_idx in range(
-                            max(0, cam_idx - 2), min(len(viewpoint_stack), cam_idx + 3)
+                            max(0, rand_idx - 2),
+                            min(len(random_viewpoint_stack), rand_idx + 3),
                         )
                     ]
                     feat_dim = feature_buffer[0].shape[-1]
@@ -1301,220 +1724,47 @@ class Mapper(object):
                         torch.randperm(feature_buffer.shape[0])[:num_samples]
                     ].unsqueeze(0)
                     sampled_uncer = self.uncer_network(sampled_feature)
-                    loss_mapping += (
-                        reg_multi
-                        * map_utils.compute_dino_regularization_loss(
-                            sampled_uncer, sampled_feature
-                        )
+                    loss_mapping += reg_multi * map_utils.compute_dino_regularization_loss(
+                        sampled_uncer, sampled_feature
                     )
 
-            scaling = self.gaussians.get_scaling
-            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
-            loss_mapping += 10 * isotropic_loss.mean()
+                viewspace_point_tensor_acm.append(viewspace_point_tensor)
+                visibility_filter_acm.append(visibility_filter)
+                radii_acm.append(radii)
+                n_touched_acm.append(n_touched)
 
-            loss_mapping.backward()
-            gaussian_split = False
-            # Deinsifying / Pruning Gaussians
-            with torch.no_grad():
-                if cur_iter == iters - 1:
-                    self._update_occ_aware_visibility(current_window)
-
-                self.gaussians.max_radii2D[visibility_filter] = torch.max(
-                    self.gaussians.max_radii2D[visibility_filter],
-                    radii[visibility_filter],
-                )
-                self.gaussians.add_densification_stats(
-                    viewspace_point_tensor, visibility_filter
-                )
-
-                update_gaussian = (
-                    self.iteration_count % self.gaussian_update_every
-                    == self.gaussian_update_offset
-                )
-                if update_gaussian:
-                    self.gaussians.densify_and_prune(
-                        self.opt_params.densify_grad_threshold,
-                        self.gaussian_th,
-                        self.gaussian_extent,
-                        self.size_threshold,
-                    )
-                    gaussian_split = True
-                    self.iterations_after_densify_or_reset = 0
-                    self.printer.print("Densify and prune the Gaussians", FontColor.MAPPER)
-
-                ## Opacity reset
-                if (self.iteration_count % self.gaussian_reset) == 0 and (
-                    not update_gaussian
+                scaling = self.gaussians.get_scaling
+                isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
+                loss_mapping += 10 * isotropic_loss.mean()
+                with self._profile_timer(
+                    "wildgs.mapper.final_refine.backward"
                 ):
-                    self.printer.print(
-                        "Resetting the opacity of non-visible Gaussians",
-                        FontColor.MAPPER,
-                    )
-                    self.gaussians.reset_opacity_nonvisible([visibility_filter])
-                    gaussian_split = True
-                    self.iterations_after_densify_or_reset = 0
+                    loss_mapping.backward()
 
-                self.gaussians.optimizer.step()
-                self.gaussians.optimizer.zero_grad(set_to_none=True)
-                self.gaussians.update_learning_rate(self.iteration_count)
-                self.keyframe_optimizers.step()
-                self.keyframe_optimizers.zero_grad(set_to_none=True)
-                if self.uncertainty_aware:
-                    self.uncer_optimizer.step()
-                    self.uncer_optimizer.zero_grad()
+                with self._profile_timer(
+                    "wildgs.mapper.final_refine.optimizer_steps"
+                ):
+                    with torch.no_grad():
+                        self.gaussians.optimizer.step()
+                        self.gaussians.optimizer.zero_grad(set_to_none=True)
+                        self.gaussians.update_learning_rate(self.iteration_count)
+                        # Optimize the exposure compensation
+                        self.keyframe_optimizers.step()
+                        self.keyframe_optimizers.zero_grad(set_to_none=True)
+                        if self.uncertainty_aware:
+                            self.uncer_optimizer.step()
+                            self.uncer_optimizer.zero_grad()
 
-            self.frame_count_log[viewpoint_kf_idx_stack[cam_idx]] += 1
+                for kf_idx in random_viewpoint_kf_idxs:
+                    self.frame_count_log[kf_idx] += 1
 
-        # Online plotting
-        if self.online_plotting:
-            plot_dir = self.save_dir + "/online_plots"
-            suffix = "_after_opt"
-            self.save_fig_everything(cur_idx, plot_dir, suffix)
+            if self.vis_uncertainty_online:
+                self._vis_uncertainty_mask_all(is_final=True)
 
-        # online plot the uncertainty mask
-        if self.vis_uncertainty_online:
-            self._vis_uncertainty_mask_all()
-        return gaussian_split
+            if self.config['gui']:
+                self._send_to_gui(self.current_window[np.array(self.current_window).argmax()])
 
-    def final_refine(self, iters=26000):
-        self.printer.print("Starting final refinement", FontColor.MAPPER)
-
-        # Do final update of depths and poses
-        self._update_keyframes_from_frontend()
-
-        random_viewpoint_stack, random_viewpoint_kf_idx_stack = [], []
-        for kf_idx, viewpoint in self.cameras.items():
-            if self.is_kf[kf_idx]:
-                random_viewpoint_stack.append(viewpoint)
-                random_viewpoint_kf_idx_stack.append(kf_idx)
-
-        for _ in tqdm(range(iters)):
-            self.iteration_count += 1
-            self.iterations_after_densify_or_reset += 1
-
-            loss_mapping = 0
-            viewspace_point_tensor_acm = []
-            visibility_filter_acm = []
-            radii_acm = []
-            n_touched_acm = []
-
-            uncer_buffer, feature_buffer = [], []
-
-            rand_idx = np.random.choice(range(len(random_viewpoint_stack)))
-            random_viewpoint_kf_idxs = []
-
-            viewpoint = random_viewpoint_stack[rand_idx]
-            random_viewpoint_kf_idxs.append(random_viewpoint_kf_idx_stack[rand_idx])
-            render_pkg = render(
-                viewpoint, self.gaussians, self.pipeline_params, self.background
-            )
-            (
-                image,
-                viewspace_point_tensor,
-                visibility_filter,
-                radii,
-                depth,
-                opacity,
-                n_touched,
-            ) = (
-                render_pkg["render"],
-                render_pkg["viewspace_points"],
-                render_pkg["visibility_filter"],
-                render_pkg["radii"],
-                render_pkg["depth"],
-                render_pkg["opacity"],
-                render_pkg["n_touched"],
-            )
-            if self.config["mapping"]["full_resolution"]:
-                depth = F.interpolate(
-                    depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
-                ).squeeze(0)
-            if not self.uncertainty_aware:
-                loss_mapping += get_loss_mapping(
-                    self.config["mapping"], image, depth, viewpoint
-                )
-            else:
-                train_frac = self.uncer_params["train_frac_fix"]
-                ssim_frac = self.uncer_params["train_frac_fix"]
-
-                (
-                    current_uncertainty,
-                    loss_mapping_this_frame,
-                ) = get_loss_mapping_uncertainty(
-                    self.config["mapping"],
-                    image,
-                    depth,
-                    viewpoint,
-                    opacity,
-                    self.uncer_network,
-                    train_frac,
-                    ssim_frac,
-                    freeze_uncertainty_loss=self.iterations_after_densify_or_reset
-                    < 200,
-                )
-                loss_mapping += loss_mapping_this_frame
-
-                stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
-                uncer_buffer.append(
-                    current_uncertainty[::stride, ::stride].unsqueeze(-1)
-                )
-                feature_buffer.append(
-                    viewpoint.features[::stride, ::stride].to(device=image.device)
-                )
-
-            if self.uncertainty_aware and self.iterations_after_densify_or_reset >= 200:
-                stride = self.config["mapping"]["uncertainty_params"]["reg_stride"]
-                reg_multi = self.config["mapping"]["uncertainty_params"]["reg_mult"]
-                viewpoint = random_viewpoint_stack[rand_idx]
-                feature_buffer = [
-                    random_viewpoint_stack[reg_cam_idx].features.to(device=image.device)
-                    for reg_cam_idx in range(
-                        max(0, rand_idx - 2),
-                        min(len(random_viewpoint_stack), rand_idx + 3),
-                    )
-                ]
-                feat_dim = feature_buffer[0].shape[-1]
-                feature_buffer = torch.stack(feature_buffer).view(-1, feat_dim)
-                num_samples = feature_buffer.shape[0] // (stride ** 4)
-                sampled_feature = feature_buffer[
-                    torch.randperm(feature_buffer.shape[0])[:num_samples]
-                ].unsqueeze(0)
-                sampled_uncer = self.uncer_network(sampled_feature)
-                loss_mapping += reg_multi * map_utils.compute_dino_regularization_loss(
-                    sampled_uncer, sampled_feature
-                )
-
-            viewspace_point_tensor_acm.append(viewspace_point_tensor)
-            visibility_filter_acm.append(visibility_filter)
-            radii_acm.append(radii)
-            n_touched_acm.append(n_touched)
-
-            scaling = self.gaussians.get_scaling
-            isotropic_loss = torch.abs(scaling - scaling.mean(dim=1).view(-1, 1))
-            loss_mapping += 10 * isotropic_loss.mean()
-            loss_mapping.backward()
-
-            with torch.no_grad():
-                self.gaussians.optimizer.step()
-                self.gaussians.optimizer.zero_grad(set_to_none=True)
-                self.gaussians.update_learning_rate(self.iteration_count)
-                # Optimize the exposure compensation
-                self.keyframe_optimizers.step()
-                self.keyframe_optimizers.zero_grad(set_to_none=True)
-                if self.uncertainty_aware:
-                    self.uncer_optimizer.step()
-                    self.uncer_optimizer.zero_grad()
-
-            for kf_idx in random_viewpoint_kf_idxs:
-                self.frame_count_log[kf_idx] += 1
-
-        if self.vis_uncertainty_online:
-            self._vis_uncertainty_mask_all(is_final=True)
-        
-        if self.config['gui']:
-            self._send_to_gui(self.current_window[np.array(self.current_window).argmax()])
-
-        self.printer.print("Final refinement done", FontColor.MAPPER)
+            self.printer.print("Final refinement done", FontColor.MAPPER)
 
     """
     Viusalization functions
@@ -1522,7 +1772,7 @@ class Mapper(object):
 
     @torch.no_grad()
     def _get_uncertainty_ssim_loss_vis(
-        self, gt_image: torch.Tensor, rendered_img: torch.Tensor, opacity: torch.Tensor
+            self, gt_image: torch.Tensor, rendered_img: torch.Tensor, opacity: torch.Tensor
     ) -> torch.Tensor:
         """
         Calculates and visualizes the SSIM-based uncertainty loss.
@@ -1574,23 +1824,26 @@ class Mapper(object):
         """
         Compute the uncertainty for a given viewpoint without gradient computation.
         """
-        features = viewpoint.features.to(self.device)
-        with Lock():
-            uncertainty = self.uncer_network(features)
+        with self._profile_timer(
+            "wildgs.mapper.uncertainty.inference_no_grad.total"
+        ):
+            features = viewpoint.features.to(self.device)
+            with Lock():
+                uncertainty = self.uncer_network(features)
 
-        # Process uncertainty values
-        uncertainty = torch.clip(uncertainty, min=0.1) + 1e-3
-        target_shape = (viewpoint.image_height, viewpoint.image_width)
-        uncertainty_resized = map_utils.resample_tensor_to_shape(
-            uncertainty, target_shape
-        )
+            # Process uncertainty values
+            uncertainty = torch.clip(uncertainty, min=0.1) + 1e-3
+            target_shape = (viewpoint.image_height, viewpoint.image_width)
+            uncertainty_resized = map_utils.resample_tensor_to_shape(
+                uncertainty, target_shape
+            )
 
-        # Apply data rate adjustment, the same as how we calculate the loss function
-        train_frac = self.uncer_params["train_frac_fix"]
-        data_rate = 1 + map_utils.compute_bias_factor(train_frac, 0.8)
-        uncertainty_adjusted = (uncertainty_resized - 0.1) * data_rate + 0.1
+            # Apply data rate adjustment, the same as how we calculate the loss function
+            train_frac = self.uncer_params["train_frac_fix"]
+            data_rate = 1 + map_utils.compute_bias_factor(train_frac, 0.8)
+            uncertainty_adjusted = (uncertainty_resized - 0.1) * data_rate + 0.1
 
-        return uncertainty_adjusted ** 2
+            return uncertainty_adjusted ** 2
 
     @torch.no_grad()
     def save_fig_everything(self, keyframe_idx: int, plot_dir: str, suffix: str = "", depth_max: float = 10.0):
@@ -1608,100 +1861,103 @@ class Mapper(object):
                                   The saved image will be named as "{keyframe_idx}{suffix}.png".
         - depth_max (float, optional): Maximum depth value for visualization. Defaults to 10.0.
         """
-        viewpoint = self.cameras[keyframe_idx]
-        render_pkg = render(
-            viewpoint, self.gaussians, self.pipeline_params, self.background
-        )
-        (rendered_img, rendered_depth,) = (
-            render_pkg["render"].detach(),
-            render_pkg["depth"].detach(),
-        )
-        if self.config["mapping"]["full_resolution"]:
-            rendered_depth = F.interpolate(
-                rendered_depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
-            ).squeeze(0)
-        gt_image = viewpoint.original_image
-        gt_depth = viewpoint.depth
-
-        rendered_img = torch.clamp(rendered_img, 0.0, 1.0)
-        gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
-        pred = (rendered_img.detach().cpu().numpy().transpose((1, 2, 0)) * 255).astype(
-            np.uint8
-        )
-        gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
-        pred = cv2.cvtColor(pred, cv2.COLOR_BGR2RGB)
-        mask = gt_image > 0
-        psnr_score = psnr(
-            (rendered_img[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0)
-        )
-        diff_rgb=np.abs(gt - pred)
-        diff_depth_l1 = torch.abs(rendered_depth.detach().cpu() - gt_depth)
-        diff_depth_l1 = diff_depth_l1 * (gt_depth > 0)
-        depth_l1 = diff_depth_l1.sum() / (gt_depth > 0).sum()
-        diff_depth_l1 = diff_depth_l1.cpu().squeeze(0)
-
-        if self.uncertainty_aware:
-            # Add plotting 2x4 grid with additional figures for uncertainty
-            # Estimated uncertainty map
-            uncertainty_map = self.get_viewpoint_uncertainty_no_grad(viewpoint)
-            uncertainty_map = uncertainty_map.cpu().squeeze(0)
-
-            # SSIM loss
-            opacity = render_pkg["opacity"].detach().squeeze()
-            ssim_loss = self._get_uncertainty_ssim_loss_vis(
-                gt_image, rendered_img, opacity
+        with self._profile_timer(
+            "wildgs.mapper.visualization.save_figure.total"
+        ):
+            viewpoint = self.cameras[keyframe_idx]
+            render_pkg = render(
+                viewpoint, self.gaussians, self.pipeline_params, self.background
             )
-            ssim_loss = ssim_loss.cpu().squeeze(0)
-        else:
-            # All white
-            uncertainty_map = torch.ones_like(rendered_img)
-            ssim_loss = torch.ones_like(rendered_img)
+            (rendered_img, rendered_depth,) = (
+                render_pkg["render"].detach(),
+                render_pkg["depth"].detach(),
+            )
+            if self.config["mapping"]["full_resolution"]:
+                rendered_depth = F.interpolate(
+                    rendered_depth.unsqueeze(0), viewpoint.depth.shape, mode="bicubic"
+                ).squeeze(0)
+            gt_image = viewpoint.original_image
+            gt_depth = viewpoint.depth
 
-        # Make the plot
-        # Determine Plot Aspect Ratio
-        aspect_ratio = gt_image.shape[2] / gt_image.shape[1]
-        fig_height = 8
-        fig_width = 11
-        fig_width = fig_width * aspect_ratio
+            rendered_img = torch.clamp(rendered_img, 0.0, 1.0)
+            gt = (gt_image.cpu().numpy().transpose((1, 2, 0)) * 255).astype(np.uint8)
+            pred = (rendered_img.detach().cpu().numpy().transpose((1, 2, 0)) * 255).astype(
+                np.uint8
+            )
+            gt = cv2.cvtColor(gt, cv2.COLOR_BGR2RGB)
+            pred = cv2.cvtColor(pred, cv2.COLOR_BGR2RGB)
+            mask = gt_image > 0
+            psnr_score = psnr(
+                (rendered_img[mask]).unsqueeze(0), (gt_image[mask]).unsqueeze(0)
+            )
+            diff_rgb = np.abs(gt - pred)
+            diff_depth_l1 = torch.abs(rendered_depth.detach().cpu() - gt_depth)
+            diff_depth_l1 = diff_depth_l1 * (gt_depth > 0)
+            depth_l1 = diff_depth_l1.sum() / (gt_depth > 0).sum()
+            diff_depth_l1 = diff_depth_l1.cpu().squeeze(0)
 
-        # Plot the Ground Truth and Rasterized RGB & Depth, along with Diff Depth & Silhouette
-        fig, axs = plt.subplots(2, 4, figsize=(fig_width, fig_height))
-        axs[0, 0].imshow(gt_image.cpu().permute(1, 2, 0))
-        axs[0, 0].set_title("Ground Truth RGB", fontsize=16)
-        axs[0, 1].imshow(gt_depth, cmap='jet', vmin=0, vmax=depth_max)
-        axs[0, 1].set_title(f"Metric Depth, vmax:{depth_max:.2f}", fontsize=16)
-        axs[1, 0].imshow(rendered_img.cpu().permute(1, 2, 0))
-        axs[1, 0].set_title("Rendered RGB, PSNR: {:.2f}".format(psnr_score.item()), fontsize=16)
-        axs[1, 1].imshow(rendered_depth[0, :, :].cpu(), cmap='jet', vmin=0, vmax=depth_max)
-        axs[1, 1].set_title("Rendered Depth, L1: {:.2f}".format(depth_l1), fontsize=16)
-        axs[0, 2].imshow(diff_rgb, cmap='jet', vmin=0, vmax=diff_rgb.max())
-        axs[0, 2].set_title(f"Diff RGB L1, vmax:{diff_rgb.max():.2f}", fontsize=16)
-        axs[1, 2].imshow(diff_depth_l1, cmap='jet', vmin=0, vmax=depth_max/5.0)
-        axs[1, 2].set_title(f"Diff Depth L1, vmax:{depth_max/5.0:.2f}", fontsize=16)
-        axs[0, 3].imshow(uncertainty_map, cmap='jet', vmin=0, vmax=5)
-        axs[0, 3].set_title("Uncertainty", fontsize=16)
-        axs[1, 3].imshow(ssim_loss, cmap='jet', vmin=0, vmax=5)
-        axs[1, 3].set_title("ssim_loss", fontsize=16)
-        
-        for i in range(2):
-            for j in range(4):
-                axs[i, j].axis('off')
-                axs[i, j].grid(False)
+            if self.uncertainty_aware:
+                # Add plotting 2x4 grid with additional figures for uncertainty
+                # Estimated uncertainty map
+                uncertainty_map = self.get_viewpoint_uncertainty_no_grad(viewpoint)
+                uncertainty_map = uncertainty_map.cpu().squeeze(0)
 
-        frame_idx = int(self.video.timestamp[keyframe_idx])
-        fig.suptitle(f"Key Frame idx ({keyframe_idx}), Frame idx ({frame_idx}), Plot{suffix}", y=0.95, fontsize=20)
-        fig.tight_layout()
+                # SSIM loss
+                opacity = render_pkg["opacity"].detach().squeeze()
+                ssim_loss = self._get_uncertainty_ssim_loss_vis(
+                    gt_image, rendered_img, opacity
+                )
+                ssim_loss = ssim_loss.cpu().squeeze(0)
+            else:
+                # All white
+                uncertainty_map = torch.ones_like(rendered_img)
+                ssim_loss = torch.ones_like(rendered_img)
 
-        os.makedirs(plot_dir, exist_ok=True)
-        save_path = os.path.join(plot_dir, f"video_idx_{keyframe_idx}_kf_idx_{frame_idx}{suffix}.png")
-        plt.savefig(save_path, bbox_inches='tight')
-        plt.close()
+            # Make the plot
+            # Determine Plot Aspect Ratio
+            aspect_ratio = gt_image.shape[2] / gt_image.shape[1]
+            fig_height = 8
+            fig_width = 11
+            fig_width = fig_width * aspect_ratio
+
+            # Plot the Ground Truth and Rasterized RGB & Depth, along with Diff Depth & Silhouette
+            fig, axs = plt.subplots(2, 4, figsize=(fig_width, fig_height))
+            axs[0, 0].imshow(gt_image.cpu().permute(1, 2, 0))
+            axs[0, 0].set_title("Ground Truth RGB", fontsize=16)
+            axs[0, 1].imshow(gt_depth, cmap='jet', vmin=0, vmax=depth_max)
+            axs[0, 1].set_title(f"Metric Depth, vmax:{depth_max:.2f}", fontsize=16)
+            axs[1, 0].imshow(rendered_img.cpu().permute(1, 2, 0))
+            axs[1, 0].set_title("Rendered RGB, PSNR: {:.2f}".format(psnr_score.item()), fontsize=16)
+            axs[1, 1].imshow(rendered_depth[0, :, :].cpu(), cmap='jet', vmin=0, vmax=depth_max)
+            axs[1, 1].set_title("Rendered Depth, L1: {:.2f}".format(depth_l1), fontsize=16)
+            axs[0, 2].imshow(diff_rgb, cmap='jet', vmin=0, vmax=diff_rgb.max())
+            axs[0, 2].set_title(f"Diff RGB L1, vmax:{diff_rgb.max():.2f}", fontsize=16)
+            axs[1, 2].imshow(diff_depth_l1, cmap='jet', vmin=0, vmax=depth_max / 5.0)
+            axs[1, 2].set_title(f"Diff Depth L1, vmax:{depth_max / 5.0:.2f}", fontsize=16)
+            axs[0, 3].imshow(uncertainty_map, cmap='jet', vmin=0, vmax=5)
+            axs[0, 3].set_title("Uncertainty", fontsize=16)
+            axs[1, 3].imshow(ssim_loss, cmap='jet', vmin=0, vmax=5)
+            axs[1, 3].set_title("ssim_loss", fontsize=16)
+
+            for i in range(2):
+                for j in range(4):
+                    axs[i, j].axis('off')
+                    axs[i, j].grid(False)
+
+            frame_idx = int(self.video.timestamp[keyframe_idx])
+            fig.suptitle(f"Key Frame idx ({keyframe_idx}), Frame idx ({frame_idx}), Plot{suffix}", y=0.95, fontsize=20)
+            fig.tight_layout()
+
+            os.makedirs(plot_dir, exist_ok=True)
+            save_path = os.path.join(plot_dir, f"video_idx_{keyframe_idx}_kf_idx_{frame_idx}{suffix}.png")
+            plt.savefig(save_path, bbox_inches='tight')
+            plt.close()
 
     def save_all_kf_figs(
-        self,
-        save_dir: str,
-        iteration: Union[str, float] ="after_refine",
-    ): 
+            self,
+            save_dir: str,
+            iteration: Union[str, float] = "after_refine",
+    ):
         """
         Save figures for all keyframes in the specified directory.
 
@@ -1710,89 +1966,95 @@ class Mapper(object):
 
         Args:
             save_dir (str): The base directory where figures will be saved.
-            iteration (Union[str, float]): A string or float representing the 
-                                        iteration or stage of the process. 
+            iteration (Union[str, float]): A string or float representing the
+                                        iteration or stage of the process.
                                         Default is "after_refine".
         """
-        video_idxs = self.video_idxs
+        with self._profile_timer(
+            "wildgs.mapper.visualization.save_all_keyframes.total"
+        ):
+            video_idxs = self.video_idxs
 
-        plot_dir = os.path.join(save_dir, "plots_" + iteration)
-        mkdir_p(plot_dir)
+            plot_dir = os.path.join(save_dir, "plots_" + iteration)
+            mkdir_p(plot_dir)
 
-        for kf_idx in video_idxs:
-            self.save_fig_everything(kf_idx, plot_dir)
-        # Create gif
-        create_gif_from_directory(plot_dir, plot_dir + '/output.gif', online=True)
+            for kf_idx in video_idxs:
+                self.save_fig_everything(kf_idx, plot_dir)
+            # Create gif
+            create_gif_from_directory(plot_dir, plot_dir + '/output.gif', online=True)
 
     @torch.no_grad()
     def _vis_uncertainty_mask_all(self, n_rows=8, n_cols=8, is_final=False):
         """Used to inspect the uncertainty"""
-        assert (
-            n_rows % 2 == 0
-        )  # one row for uncertainty, one for imgs, the other for uncertainty
+        with self._profile_timer(
+            "wildgs.mapper.visualization.uncertainty_all.total"
+        ):
+            assert (
+                    n_rows % 2 == 0
+            )  # one row for uncertainty, one for imgs, the other for uncertainty
 
-        n_img = int(n_rows * n_cols / 2)
-        if n_img >= len(self.cameras):
-            keyframe_idxs = list(self.cameras.keys())
-        else:
-            keyframe_idxs = (
-                list(self.cameras.keys())[:n_cols]
-                + list(self.cameras.keys())[-(n_img - n_cols) :]
+            n_img = int(n_rows * n_cols / 2)
+            if n_img >= len(self.cameras):
+                keyframe_idxs = list(self.cameras.keys())
+            else:
+                keyframe_idxs = (
+                        list(self.cameras.keys())[:n_cols]
+                        + list(self.cameras.keys())[-(n_img - n_cols):]
+                )
+
+            h = self.cameras[keyframe_idxs[0]].image_height
+            w = self.cameras[keyframe_idxs[0]].image_width
+            all_white = (np.ones((h, w, 3)) * 255).astype(np.uint8)
+
+            aspect_ratio = w / h
+            fig_height = 8
+            fig_width = 8.5
+            fig, axs = plt.subplots(
+                n_rows,
+                n_cols,
+                figsize=(n_cols * fig_width * aspect_ratio, n_rows * fig_height),
             )
+            for i in range(0, n_rows // 2):
+                for j in range(n_cols):
+                    idx = i * n_cols + j
+                    if idx >= len(keyframe_idxs):
+                        axs[2 * i, j].imshow(all_white)
+                        axs[2 * i + 1, j].imshow(all_white)
+                    else:
+                        viewpoint = self.cameras[keyframe_idxs[idx]]
+                        rgb = viewpoint.original_image.cpu().permute(1, 2, 0).numpy()
+                        rgb = (rgb * 255.0).astype(np.uint8)
+                        uncer_resized = self.get_viewpoint_uncertainty_no_grad(viewpoint)
+                        uncer_resized = uncer_resized.cpu().squeeze(0)
 
-        h = self.cameras[keyframe_idxs[0]].image_height
-        w = self.cameras[keyframe_idxs[0]].image_width
-        all_white = (np.ones((h, w, 3)) * 255).astype(np.uint8)
-
-        aspect_ratio = w / h
-        fig_height = 8
-        fig_width = 8.5
-        fig, axs = plt.subplots(
-            n_rows,
-            n_cols,
-            figsize=(n_cols * fig_width * aspect_ratio, n_rows * fig_height),
-        )
-        for i in range(0, n_rows // 2):
-            for j in range(n_cols):
-                idx = i * n_cols + j
-                if idx >= len(keyframe_idxs):
-                    axs[2 * i, j].imshow(all_white)
-                    axs[2 * i + 1, j].imshow(all_white)
-                else:
-                    viewpoint = self.cameras[keyframe_idxs[idx]]
-                    rgb = viewpoint.original_image.cpu().permute(1, 2, 0).numpy()
-                    rgb = (rgb * 255.0).astype(np.uint8)
-                    uncer_resized = self.get_viewpoint_uncertainty_no_grad(viewpoint)
-                    uncer_resized = uncer_resized.cpu().squeeze(0)
-
-                    axs[2 * i, j].imshow(rgb)
-                    if keyframe_idxs[idx] in self.current_window:
-                        # used for highlight
-                        rect = patches.Rectangle(
-                            (0, 0),
-                            1,
-                            1,
-                            linewidth=30,
-                            edgecolor="red",
-                            facecolor="none",
-                            transform=axs[2 * i, j].transAxes,
+                        axs[2 * i, j].imshow(rgb)
+                        if keyframe_idxs[idx] in self.current_window:
+                            # used for highlight
+                            rect = patches.Rectangle(
+                                (0, 0),
+                                1,
+                                1,
+                                linewidth=30,
+                                edgecolor="red",
+                                facecolor="none",
+                                transform=axs[2 * i, j].transAxes,
+                            )
+                            axs[2 * i, j].add_patch(rect)
+                        axs[2 * i + 1, j].imshow(
+                            uncer_resized ** 2, cmap="jet", vmin=0, vmax=5
                         )
-                        axs[2 * i, j].add_patch(rect)
-                    axs[2 * i + 1, j].imshow(
-                        uncer_resized ** 2, cmap="jet", vmin=0, vmax=5
-                    )
-                    axs[2 * i + 1, j].grid(False)
-                axs[2 * i, j].axis("off")
-                axs[2 * i + 1, j].axis("off")
+                        axs[2 * i + 1, j].grid(False)
+                    axs[2 * i, j].axis("off")
+                    axs[2 * i + 1, j].axis("off")
 
-        fig.tight_layout()
-        cur_idx = self.current_window[np.array(self.current_window).argmax()]
-        os.makedirs(os.path.join(self.save_dir, "online_uncer"), exist_ok=True)
-        if is_final:
-            save_path = os.path.join(
-                self.save_dir, "online_uncer", f"after_final_refine.png"
-            )
-        else:
-            save_path = os.path.join(self.save_dir, "online_uncer", f"{cur_idx}.png")
-        plt.savefig(save_path, bbox_inches="tight")
-        plt.close()
+            fig.tight_layout()
+            cur_idx = self.current_window[np.array(self.current_window).argmax()]
+            os.makedirs(os.path.join(self.save_dir, "online_uncer"), exist_ok=True)
+            if is_final:
+                save_path = os.path.join(
+                    self.save_dir, "online_uncer", f"after_final_refine.png"
+                )
+            else:
+                save_path = os.path.join(self.save_dir, "online_uncer", f"{cur_idx}.png")
+            plt.savefig(save_path, bbox_inches="tight")
+            plt.close()
