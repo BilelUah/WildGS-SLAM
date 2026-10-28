@@ -1,5 +1,7 @@
 from contextlib import nullcontext
+from pathlib import Path
 
+import numpy as np
 import lietorch
 import torch
 
@@ -74,8 +76,30 @@ class MotionFilter:
             + cfg["scene"]
         )
 
-        self.metric_depth_estimator = (
-            get_metric_depth_estimator(cfg)
+        # Navigator adds this optional policy only for integrated runs.
+        # Standalone original WildGS still defaults to Metric3D.
+        navigator_config = cfg.get("navigator", {})
+        self.use_sensor_depth = (
+            navigator_config.get("depth_source", "metric") == "sensor"
+        )
+        if self.use_sensor_depth and not navigator_config.get("is_live", False):
+            raise ValueError(
+                "[WILDGS SENSOR] RealSense sensor depth is live-only. "
+                "Offline WildGS must use Metric3D."
+            )
+
+        if self.use_sensor_depth:
+            # Avoid initializing the Metric3D model in live sensor mode.
+            self.metric_depth_estimator = None
+        else:
+            # ORIGINAL WILDGS: preserved as-is in both offline and live metric.
+            self.metric_depth_estimator = (
+                get_metric_depth_estimator(cfg)
+            )
+
+        print(
+            "[WildGS MotionFilter] depth source:",
+            "sensor" if self.use_sensor_depth else "metric",
         )
 
         if cfg["mapping"][
@@ -246,6 +270,46 @@ class MotionFilter:
 
         return dino_features
 
+    def _sensor_depth_for_keyframe(self, external_depth, image, tstamp):
+        """Validate aligned RealSense depth (metres) for DepthVideo insertion.
+
+        RGB/depth rotation and resizing are handled by the existing Navigator
+        ROS2 dataset and tracking adapter. Do not re-scale or infer depth here.
+        """
+        if external_depth is None:
+            raise ValueError(
+                "[WILDGS SENSOR] Missing synchronized RealSense depth."
+            )
+
+        depth = torch.as_tensor(
+            external_depth, dtype=torch.float32, device=self.device
+        )
+        expected_shape = tuple(int(s) for s in image.shape[-2:])
+        if depth.ndim != 2 or tuple(depth.shape) != expected_shape:
+            raise ValueError(
+                "[WILDGS SENSOR] Aligned depth/RGB size mismatch: "
+                f"depth={tuple(depth.shape)}, RGB={expected_shape}"
+            )
+        if not bool(torch.isfinite(depth).all()):
+            raise ValueError("[WILDGS SENSOR] Depth contains NaN or Inf")
+        if bool((depth < 0).any()):
+            raise ValueError("[WILDGS SENSOR] Depth contains negative values")
+        if not bool((depth > 0).any()):
+            raise ValueError("[WILDGS SENSOR] Depth has no valid pixels")
+
+        depth = depth.contiguous()
+
+        # The existing WildGS Mapper reloads each accepted keyframe through
+        # load_metric_depth(frame_idx, self.save_dir), even when metric_depth_reg
+        # is enabled. Preserve its original on-disk depth contract in Sensor mode.
+        # This is a RAW sensor depth map in metres, not a Metric3D prediction.
+        depth_dir = Path(self.save_dir) / "mono_priors" / "depths"
+        depth_dir.mkdir(parents=True, exist_ok=True)
+        depth_path = depth_dir / f"{int(tstamp):05d}.npy"
+        np.save(depth_path, depth.detach().cpu().numpy().astype(np.float32))
+
+        return depth
+
     # =========================================================
     # 4. Main MotionFilter operation
     # =========================================================
@@ -260,6 +324,7 @@ class MotionFilter:
         tstamp,
         image,
         intrinsics=None,
+        external_depth=None,
     ):
         """
         Run MotionFilter on one incoming frame.
@@ -298,6 +363,14 @@ class MotionFilter:
 
         Parent timers include their children.
         """
+        # A sensor frame must never silently switch to Metric3D (or reverse).
+        if self.use_sensor_depth and external_depth is None:
+            raise ValueError("[WILDGS SENSOR] Missing external_depth")
+        if not self.use_sensor_depth and external_depth is not None:
+            raise ValueError(
+                "[WILDGS METRIC] Unexpected external_depth in Metric3D mode"
+            )
+
         self._profile_count(
             "wildgs.motion_filter.frames.received"
         )
@@ -390,20 +463,31 @@ class MotionFilter:
                     self.fmap = gmap
 
                     with self._profile_timer(
-                        "wildgs.motion_filter.first_frame.metric_depth"
-                    ):
-                        mono_depth = (
-                            predict_metric_depth(
-                                self.metric_depth_estimator,
-                                tstamp,
-                                image,
-                                self.cfg,
-                                self.device,
-                            )
+                        (
+                            "wildgs.motion_filter.first_frame.sensor_depth"
+                            if self.use_sensor_depth
+                            else "wildgs.motion_filter.first_frame.metric_depth"
                         )
+                    ):
+                        if self.use_sensor_depth:
+                            mono_depth = self._sensor_depth_for_keyframe(
+                                external_depth, image, tstamp
+                            )
+                        else:
+                            mono_depth = (
+                                predict_metric_depth(
+                                    self.metric_depth_estimator,
+                                    tstamp,
+                                    image,
+                                    self.cfg,
+                                    self.device,
+                                )
+                            )
 
                     self._profile_count(
-                        "wildgs.motion_filter.metric_depth_predictions"
+                        "wildgs.motion_filter.sensor_depth_keyframes"
+                        if self.use_sensor_depth
+                        else "wildgs.motion_filter.metric_depth_predictions"
                     )
 
                     dino_features = (
@@ -587,20 +671,31 @@ class MotionFilter:
                             self.fmap = gmap
 
                             with self._profile_timer(
-                                "wildgs.motion_filter.accepted_keyframe.metric_depth"
-                            ):
-                                mono_depth = (
-                                    predict_metric_depth(
-                                        self.metric_depth_estimator,
-                                        tstamp,
-                                        image,
-                                        self.cfg,
-                                        self.device,
-                                    )
+                                (
+                                    "wildgs.motion_filter.accepted_keyframe.sensor_depth"
+                                    if self.use_sensor_depth
+                                    else "wildgs.motion_filter.accepted_keyframe.metric_depth"
                                 )
+                            ):
+                                if self.use_sensor_depth:
+                                    mono_depth = self._sensor_depth_for_keyframe(
+                                        external_depth, image, tstamp
+                                    )
+                                else:
+                                    mono_depth = (
+                                        predict_metric_depth(
+                                            self.metric_depth_estimator,
+                                            tstamp,
+                                            image,
+                                            self.cfg,
+                                            self.device,
+                                        )
+                                    )
 
                             self._profile_count(
-                                "wildgs.motion_filter.metric_depth_predictions"
+                                "wildgs.motion_filter.sensor_depth_keyframes"
+                                if self.use_sensor_depth
+                                else "wildgs.motion_filter.metric_depth_predictions"
                             )
 
                             dino_features = (
