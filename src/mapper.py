@@ -216,10 +216,12 @@ class Mapper(object):
 
             if is_init:
                 self.printer.print("Initializing the mapping", FontColor.MAPPER)
+
                 with self._profile_timer(
                     "wildgs.mapper.run.initialize_mapper"
                 ):
                     self.initialize_mapper(video_idx)
+
                 self.pipe.send("continue")
                 continue
 
